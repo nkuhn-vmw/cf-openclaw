@@ -1,0 +1,53 @@
+# Cloud Foundry ignore file for OpenClaw
+# Similar to .gitignore but specific to cf push
+
+# Dependencies (will be installed during staging)
+node_modules/
+.pnpm-store/
+
+# Development files
+.git/
+.github/
+test/
+*.test.ts
+vitest*.config.ts
+.env
+.env.*
+!.env.example
+
+# Build artifacts - keep dist/ since CF buildpack doesn't build
+# dist/
+*.tsbuildinfo
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Native apps (not needed for cloud deployment)
+apps/ios/
+apps/android/
+apps/macos/
+Swabble/
+
+# Documentation
+docs/
+*.md
+!README.md
+
+# Docker files (not needed for buildpack deployment)
+Dockerfile*
+docker-compose.yml
+docker-setup.sh
+
+# Other deployment configs
+fly.toml
+fly.private.toml
+render.yaml
+appcast.xml
+
+# Secrets
+.secrets.baseline
+.detect-secrets.cfg

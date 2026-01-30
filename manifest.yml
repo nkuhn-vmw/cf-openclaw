@@ -1,0 +1,43 @@
+# Cloud Foundry deployment manifest for OpenClaw
+# Deploy with: cf push
+---
+applications:
+  - name: openclaw
+    memory: 2G
+    disk_quota: 2G
+    instances: 1
+
+    # Option 1: Docker-based deployment (recommended)
+    # Uses the existing Dockerfile from OpenClaw
+    docker:
+      image: openclaw/openclaw:latest
+
+    command: node dist/index.js gateway --allow-unconfigured --port 8080 --bind lan
+
+    # Option 2: Buildpack deployment (uncomment and comment out docker section)
+    # buildpacks:
+    #   - nodejs_buildpack
+    # command: node dist/index.js gateway --allow-unconfigured --port $PORT --bind lan
+
+    env:
+      NODE_ENV: production
+      NODE_OPTIONS: "--max-old-space-size=1536"
+      # OpenClaw configuration
+      OPENCLAW_STATE_DIR: /home/vcap/app/data
+      OPENCLAW_PREFER_PNPM: "1"
+      # AI Provider API keys (set via cf set-env or bind to a secrets service)
+      # ANTHROPIC_API_KEY: (set separately)
+      # OPENAI_API_KEY: (set separately)
+
+    routes:
+      - route: openclaw.apps.tas-tdc.kuhn-labs.com
+
+    health-check-type: port
+    timeout: 180
+
+    # Enable WebSocket support
+    # Note: Your CF deployment must have WebSocket support enabled
+
+    # services:
+    #   # Bind a volume service for persistent storage (optional)
+    #   - openclaw-storage

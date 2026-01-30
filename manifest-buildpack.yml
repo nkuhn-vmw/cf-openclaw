@@ -1,0 +1,36 @@
+# Cloud Foundry buildpack deployment manifest for OpenClaw
+# Use this if your CF environment doesn't support Docker
+# Deploy with: cf push -f manifest-buildpack.yml
+---
+applications:
+  - name: openclaw
+    memory: 2G
+    disk_quota: 4G
+    instances: 1
+
+    buildpacks:
+      - nodejs_buildpack
+
+    # Start the gateway server
+    command: node dist/index.js gateway --allow-unconfigured --port $PORT --bind lan
+
+    env:
+      NODE_ENV: production
+      NODE_OPTIONS: "--max-old-space-size=1536"
+      # Required for build
+      OPENCLAW_PREFER_PNPM: "1"
+      OPENCLAW_A2UI_SKIP_MISSING: "1"
+      # State directory
+      OPENCLAW_STATE_DIR: /home/vcap/app/data
+      # AI Provider API keys (set via cf set-env)
+      # ANTHROPIC_API_KEY: (set separately)
+      # OPENAI_API_KEY: (set separately)
+
+    routes:
+      - route: openclaw.apps.tas-tdc.kuhn-labs.com
+
+    health-check-type: port
+    timeout: 300
+
+    services:
+      - openclaw-genai
