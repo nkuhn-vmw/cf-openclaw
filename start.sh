@@ -43,9 +43,11 @@ if [ "${OPENCLAW_SSO_ENABLED}" = "true" ] && [ -f "${HOME}/sso.env" ]; then
     COOKIE_SECRET="${OPENCLAW_COOKIE_SECRET:-$(openssl rand -base64 32)}"
 
     # Determine the OIDC issuer URL
-    # p-identity issuer_uri is typically: https://<plan>.login.<system-domain>/oauth/token
-    # oauth2-proxy needs the base OIDC issuer (without /oauth/token)
-    OIDC_ISSUER="${SSO_ISSUER_URI}"
+    # CF UAA has a split architecture: login.sys.* serves the OIDC discovery
+    # endpoint but reports uaa.sys.* as the issuer. oauth2-proxy strict issuer
+    # checking will fail, so we use --insecure-oidc-skip-issuer-verification.
+    # Use auth_domain as the discovery base URL.
+    OIDC_ISSUER="${SSO_AUTH_DOMAIN}"
     if [[ "$OIDC_ISSUER" == */oauth/token ]]; then
         OIDC_ISSUER="${OIDC_ISSUER%/oauth/token}"
     fi
@@ -69,6 +71,7 @@ if [ "${OPENCLAW_SSO_ENABLED}" = "true" ] && [ -f "${HOME}/sso.env" ]; then
     "$PROXY_BIN" \
         --provider=oidc \
         --oidc-issuer-url="${OIDC_ISSUER}" \
+        --insecure-oidc-skip-issuer-verification=true \
         --client-id="${SSO_CLIENT_ID}" \
         --client-secret="${SSO_CLIENT_SECRET}" \
         --redirect-url="${REDIRECT_URL}" \
