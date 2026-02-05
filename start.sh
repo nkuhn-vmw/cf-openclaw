@@ -2,7 +2,7 @@
 # OpenClaw Cloud Foundry Startup Script
 # Handles two modes:
 #   1. Direct: OpenClaw listens on $PORT (default)
-#   2. SSO:    oauth2-proxy on $PORT → token-redirect on :8082 → OpenClaw on :8081
+#   2. SSO:    oauth2-proxy on $PORT → token-inject on :8082 → OpenClaw on :8081
 set -e
 
 OPENCLAW_PORT="${PORT:-8080}"
@@ -65,12 +65,12 @@ if [ "${OPENCLAW_SSO_ENABLED}" = "true" ] && [ -f "${HOME}/sso.env" ]; then
     node dist/index.js gateway --allow-unconfigured --port "$OPENCLAW_INTERNAL_PORT" --bind lan &
     OPENCLAW_PID=$!
 
-    # ---- Start token redirect proxy ----
-    # This tiny proxy sits between oauth2-proxy and OpenClaw. It ensures the
-    # gateway token is injected into the initial page URL so the Control UI
-    # JavaScript stores it in localStorage for WebSocket authentication.
+    # ---- Start token injection proxy ----
+    # This proxy sits between oauth2-proxy and OpenClaw. For HTML page loads
+    # it injects a <script> tag that stores the gateway token in localStorage
+    # so the Control UI can authenticate WebSocket connections.
     # All other requests (including WebSocket upgrades) are raw-piped through.
-    echo "Starting token redirect proxy on port ${TOKEN_PROXY_PORT}..."
+    echo "Starting token injection proxy on port ${TOKEN_PROXY_PORT}..."
     export GATEWAY_TOKEN="${GATEWAY_TOKEN}"
     export UPSTREAM_PORT="${OPENCLAW_INTERNAL_PORT}"
     export LISTEN_PORT="${TOKEN_PROXY_PORT}"
@@ -80,33 +80,64 @@ const net = require('net');
 const TOKEN = process.env.GATEWAY_TOKEN;
 const UPSTREAM = parseInt(process.env.UPSTREAM_PORT, 10);
 
+// Script tag that injects the gateway token into localStorage before the app JS runs.
+// The Control UI reads from localStorage key 'openclaw.control.settings.v1' with
+// the token stored under the 'token' property.
+const INJECT_SCRIPT = '<script>try{var k=\"openclaw.control.settings.v1\",s=JSON.parse(localStorage.getItem(k)||\"{}\");s.token=\"' + TOKEN + '\";localStorage.setItem(k,JSON.stringify(s))}catch(e){}</script>';
+
 const server = http.createServer((req, res) => {
     const url = new URL(req.url, 'http://localhost');
 
-    // Redirect root and /chat paths to include the gateway token
-    // so the Control UI stores it in localStorage for WS auth
-    if ((url.pathname === '/' || url.pathname === '/chat') && !url.searchParams.has('token')) {
-        url.searchParams.set('token', TOKEN);
-        res.writeHead(302, { Location: url.pathname + url.search });
-        res.end();
-        return;
+    // For page loads (/ and /chat), proxy to OpenClaw and inject the token
+    // into the HTML response so localStorage gets set before the app JS runs
+    const isPageLoad = (url.pathname === '/' || url.pathname === '/chat') && req.method === 'GET';
+
+    // Strip Accept-Encoding for page loads so we get uncompressed HTML to inject into
+    const headers = { ...req.headers };
+    if (isPageLoad) {
+        delete headers['accept-encoding'];
     }
 
-    // Proxy all other HTTP requests to OpenClaw
     const opts = {
         hostname: '127.0.0.1',
         port: UPSTREAM,
         path: req.url,
         method: req.method,
-        headers: req.headers
+        headers: headers
     };
     const proxyReq = http.request(opts, (proxyRes) => {
-        res.writeHead(proxyRes.statusCode, proxyRes.headers);
-        proxyRes.pipe(res);
+        const ct = (proxyRes.headers['content-type'] || '');
+        if (isPageLoad && ct.includes('text/html')) {
+            // Buffer the HTML, inject token script, then send
+            const chunks = [];
+            proxyRes.on('data', (c) => chunks.push(c));
+            proxyRes.on('end', () => {
+                let html = Buffer.concat(chunks).toString();
+                html = html.replace('<head>', '<head>' + INJECT_SCRIPT);
+                const respHeaders = { ...proxyRes.headers };
+                respHeaders['content-length'] = Buffer.byteLength(html);
+                delete respHeaders['content-encoding'];
+                res.writeHead(proxyRes.statusCode, respHeaders);
+                res.end(html);
+            });
+        } else {
+            // Non-HTML or non-page-load: stream through
+            res.writeHead(proxyRes.statusCode, proxyRes.headers);
+            proxyRes.pipe(res);
+        }
     });
     proxyReq.on('error', () => {
-        res.writeHead(502);
-        res.end('upstream unavailable');
+        if (isPageLoad) {
+            // Serve a loading page that injects the token into localStorage and auto-refreshes.
+            // This handles the startup race condition: the browser gets the token saved immediately,
+            // and when the page refreshes after OpenClaw is ready, WS auth will work.
+            const loadingHtml = '<!DOCTYPE html><html><head>' + INJECT_SCRIPT + '<meta http-equiv=\"refresh\" content=\"5\"><style>body{font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;color:#666}div{text-align:center}h2{color:#333}.spinner{width:40px;height:40px;border:4px solid #eee;border-top-color:#333;border-radius:50%;animation:spin 1s linear infinite;margin:20px auto}@keyframes spin{to{transform:rotate(360deg)}}</style></head><body><div><div class=\"spinner\"></div><h2>Starting OpenClaw</h2><p>The application is starting up. This page will refresh automatically.</p></div></body></html>';
+            res.writeHead(200, { 'Content-Type': 'text/html', 'Content-Length': Buffer.byteLength(loadingHtml) });
+            res.end(loadingHtml);
+        } else {
+            res.writeHead(502);
+            res.end('upstream unavailable');
+        }
     });
     req.pipe(proxyReq);
 });
@@ -130,7 +161,7 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 server.listen(parseInt(process.env.LISTEN_PORT, 10), '127.0.0.1', () => {
-    console.log('Token redirect proxy ready on 127.0.0.1:' + process.env.LISTEN_PORT);
+    console.log('Token injection proxy ready on 127.0.0.1:' + process.env.LISTEN_PORT);
 });
 " &
     TOKEN_PROXY_PID=$!
@@ -142,7 +173,7 @@ server.listen(parseInt(process.env.LISTEN_PORT, 10), '127.0.0.1', () => {
     echo "Starting oauth2-proxy on port ${OPENCLAW_PORT}..."
     echo "  OIDC Issuer: ${OIDC_ISSUER}"
     echo "  Redirect URL: ${REDIRECT_URL}"
-    echo "  Upstream: http://127.0.0.1:${TOKEN_PROXY_PORT} → http://127.0.0.1:${OPENCLAW_INTERNAL_PORT}"
+    echo "  Upstream: http://127.0.0.1:${TOKEN_PROXY_PORT} (token inject) → http://127.0.0.1:${OPENCLAW_INTERNAL_PORT}"
 
     "$PROXY_BIN" \
         --provider=oidc \
