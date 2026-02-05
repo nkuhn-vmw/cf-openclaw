@@ -50,7 +50,5 @@ applications:
     timeout: 300
 
     services:
-      - openclaw-genai
-      # Uncomment to enable SSO (after creating the service):
-      # cf create-service p-identity <plan> openclaw-sso
-      # - openclaw-sso
+      - tanzu-all-models
+      - openclaw-sso

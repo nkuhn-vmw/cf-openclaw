@@ -120,20 +120,27 @@ if (genaiBinding) {
 }
 
 // --- Gateway Authentication ---
+// Gateway token auth is always configured. When SSO is enabled, the token
+// redirect proxy (in start.sh) auto-injects the token into the initial URL
+// so the browser stores it for WebSocket auth.
+const ssoEnabled = process.env.OPENCLAW_SSO_ENABLED === 'true';
+
 let gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN;
 if (!gatewayToken) {
-    // Auto-generate a token if not provided
     const crypto = require('crypto');
     gatewayToken = crypto.randomBytes(32).toString('hex');
     console.log('');
     console.log('=== Gateway Authentication ===');
     console.log('Auto-generated gateway token (no OPENCLAW_GATEWAY_TOKEN env var set):');
     console.log('  Token: ' + gatewayToken);
-    console.log('  Set this in your client to connect to the gateway.');
-    console.log('  To use a fixed token: cf set-env openclaw OPENCLAW_GATEWAY_TOKEN <your-token>');
+    if (ssoEnabled) {
+        console.log('  Token will be auto-injected via SSO redirect proxy.');
+    } else {
+        console.log('  Set this in your client to connect to the gateway.');
+        console.log('  To use a fixed token: cf set-env openclaw OPENCLAW_GATEWAY_TOKEN <your-token>');
+    }
 }
 
-// --- Build OpenClaw Config ---
 const config = {
     gateway: {
         auth: {
@@ -169,11 +176,13 @@ if (ssoBinding) {
     console.log('  Issuer URI: ' + (ssoBinding.issuer_uri || 'not provided'));
 
     // Write SSO credentials to env file for start.sh to consume
+    // Include the gateway token so start.sh can inject it into the proxy
     const ssoEnv = [
         'SSO_AUTH_DOMAIN=' + ssoBinding.auth_domain,
         'SSO_CLIENT_ID=' + ssoBinding.client_id,
         'SSO_CLIENT_SECRET=' + ssoBinding.client_secret,
         'SSO_ISSUER_URI=' + (ssoBinding.issuer_uri || ssoBinding.auth_domain + '/oauth/token'),
+        'SSO_GATEWAY_TOKEN=' + gatewayToken,
         ''
     ].join('\\n');
     fs.writeFileSync(process.env.HOME + '/sso.env', ssoEnv);
@@ -234,7 +243,7 @@ console.log('OpenClaw config written to: ' + configPath);
 if (genaiConfig) {
     console.log('Primary model: ' + genaiConfig.modelId);
 }
-console.log('Gateway auth: token mode');
+console.log('Gateway auth: token mode' + (ssoEnabled ? ' (auto-injected via SSO proxy)' : ''));
 " 2>&1
 
     if [ $? -eq 0 ]; then
