@@ -1,6 +1,11 @@
 # Cloud Foundry buildpack deployment manifest for OpenClaw
-# Use this if your CF environment doesn't support Docker
 # Deploy with: cf push -f manifest-buildpack.yml
+#
+# Prerequisites:
+#   1. Clone and build OpenClaw: pnpm install && pnpm build && pnpm ui:build
+#   2. Copy these deployment files into the OpenClaw directory
+#   3. Create a GenAI service: cf create-service genai <plan> openclaw-genai
+#   4. (Optional) Enable SSO: see README.md for setup instructions
 ---
 applications:
   - name: openclaw
@@ -11,8 +16,8 @@ applications:
     buildpacks:
       - nodejs_buildpack
 
-    # Start the gateway server
-    command: node dist/index.js gateway --allow-unconfigured --port $PORT --bind lan
+    # start.sh handles SSO proxy (if enabled) or direct startup
+    command: bash start.sh
 
     env:
       NODE_ENV: production
@@ -22,9 +27,21 @@ applications:
       OPENCLAW_A2UI_SKIP_MISSING: "1"
       # State directory
       OPENCLAW_STATE_DIR: /home/vcap/app/data
-      # AI Provider API keys (set via cf set-env)
-      # ANTHROPIC_API_KEY: (set separately)
-      # OPENAI_API_KEY: (set separately)
+
+      # --- Gateway Authentication ---
+      # Set a fixed token for connecting clients.
+      # If not set, a random token is auto-generated on each startup (check cf logs).
+      # OPENCLAW_GATEWAY_TOKEN: (set via cf set-env openclaw OPENCLAW_GATEWAY_TOKEN <token>)
+
+      # --- SSO Configuration ---
+      # Set to "true" to enable oauth2-proxy SSO in front of OpenClaw.
+      # Requires p-identity service bound (openclaw-sso).
+      # OPENCLAW_SSO_ENABLED: "true"
+      # OPENCLAW_COOKIE_SECRET: (set via cf set-env, use: openssl rand -base64 32)
+
+      # --- Manual API Keys (alternative to GenAI service) ---
+      # ANTHROPIC_API_KEY: (set via cf set-env)
+      # OPENAI_API_KEY: (set via cf set-env)
 
     routes:
       - route: openclaw.apps.tas-tdc.kuhn-labs.com
@@ -34,3 +51,6 @@ applications:
 
     services:
       - openclaw-genai
+      # Uncomment to enable SSO (after creating the service):
+      # cf create-service p-identity <plan> openclaw-sso
+      # - openclaw-sso
