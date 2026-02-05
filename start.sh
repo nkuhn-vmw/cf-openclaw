@@ -79,6 +79,7 @@ if [ "${OPENCLAW_SSO_ENABLED}" = "true" ] && [ -f "${HOME}/sso.env" ]; then
         --http-address="0.0.0.0:${OPENCLAW_PORT}" \
         --cookie-secret="${COOKIE_SECRET}" \
         --cookie-secure=true \
+        --scope="openid" \
         --email-domain="*" \
         --pass-access-token=true \
         --pass-authorization-header=true \
