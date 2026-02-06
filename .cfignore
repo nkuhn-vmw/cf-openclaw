@@ -32,10 +32,12 @@ apps/android/
 apps/macos/
 Swabble/
 
-# Documentation
+# Documentation (keep workspace templates - required at runtime)
 docs/
+!docs/reference/templates/
 *.md
 !README.md
+!docs/reference/templates/*.md
 
 # Docker files (not needed for buildpack deployment)
 Dockerfile*
