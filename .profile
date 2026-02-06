@@ -112,8 +112,11 @@ if (genaiBinding) {
             console.log('  Primary Model: ' + modelName);
 
             const providerName = 'tanzu-genai';
-            const sanitizedModel = modelName.replace(/[^a-zA-Z0-9._-]/g, '-');
-            const modelId = providerName + '/' + sanitizedModel;
+            // Only strip '/' from model ID (conflicts with provider/model path format).
+            // Preserve colons and other chars — the id is sent as the 'model' param in
+            // the API request and must match what the GenAI proxy expects.
+            const apiModelId = modelName.replace(/\\//g, '-');
+            const modelId = providerName + '/' + apiModelId;
 
             // Determine the correct base URL for OpenClaw
             // The GenAI proxy serves at \$API_BASE/openai/v1/...
@@ -132,13 +135,19 @@ if (genaiBinding) {
                     api: 'openai-completions',
                     models: [
                         {
-                            id: sanitizedModel,
+                            id: apiModelId,
                             name: modelName,
                             reasoning: false,
                             input: ['text'],
                             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
                             contextWindow: 32768,
-                            maxTokens: 8192
+                            maxTokens: 8192,
+                            // Tanzu GenAI proxy (vLLM-based) doesn't support newer OpenAI params
+                            compat: {
+                                maxTokensField: 'max_tokens',
+                                supportsDeveloperRole: false,
+                                supportsStore: false
+                            }
                         }
                     ]
                 }
