@@ -7,6 +7,7 @@ Deploy [OpenClaw](https://github.com/openclaw/openclaw) to Cloud Foundry with au
 - **GenAI Service Integration**: Automatically configures OpenClaw to use CF marketplace LLM models (no cloud API keys needed)
 - **SSO Authentication**: Optional oauth2-proxy sidecar using CF's p-identity SSO service
 - **Gateway Auth**: Mandatory token-based authentication for the OpenClaw gateway
+- **Node Deployment**: Deploy nodes for system.run capabilities with auto-pairing via container-to-container networking
 - **Dual Format Support**: Works with both deprecated single-model and new multi-model GenAI credential formats
 
 ## Files
@@ -14,10 +15,12 @@ Deploy [OpenClaw](https://github.com/openclaw/openclaw) to Cloud Foundry with au
 | File | Description |
 |------|-------------|
 | `manifest-buildpack.yml` | CF manifest for Node.js buildpack deployment (recommended) |
+| `manifest-node.yml` | CF manifest for deploying an OpenClaw node |
 | `manifest.yml` | CF manifest for Docker-based deployment (reference) |
 | `.cfignore` | Files to exclude from `cf push` |
-| `.profile` | Startup script that auto-configures GenAI, gateway auth, and SSO |
+| `.profile` | Startup script that auto-configures GenAI, gateway auth, SSO, and node pairing |
 | `start.sh` | Process wrapper handling SSO proxy or direct startup |
+| `start-node.sh` | Startup script for node deployment |
 | `deploy.sh` | Interactive deployment helper script |
 
 ## Quick Start
@@ -147,6 +150,79 @@ cf set-env openclaw OPENCLAW_SSO_ENABLED false
 cf restage openclaw
 ```
 
+## Node Deployment (Optional)
+
+Deploy an OpenClaw node to provide `system.run` and `system.which` capabilities to the gateway. This allows agents to execute shell commands in a controlled CF environment.
+
+### Architecture
+
+```
+Gateway (openclaw) ←── internal networking ──→ Node (openclaw-node)
+     :8081                                         connects outbound
+```
+
+The node connects to the gateway via CF container-to-container networking using an internal route.
+
+### Setup
+
+#### 1. Generate a device keypair
+
+```bash
+node -e "const c=require('crypto');const k=c.generateKeyPairSync('ed25519');console.log(k.publicKey.export({type:'spki',format:'pem'}));console.log(k.privateKey.export({type:'pkcs8',format:'pem'}))"
+```
+
+Save both keys - they're needed for auto-pairing.
+
+#### 2. Configure the gateway with the node's public key
+
+```bash
+cf set-env openclaw OPENCLAW_NODE_DEVICE_PUBLIC_KEY "-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEA...
+-----END PUBLIC KEY-----"
+cf restage openclaw
+```
+
+#### 3. Deploy the node
+
+```bash
+# Copy node deployment files to openclaw source directory
+cp manifest-node.yml start-node.sh /path/to/openclaw/
+
+# Get the gateway token
+cf logs openclaw --recent | grep "Token:"
+
+# Deploy and configure
+cd /path/to/openclaw
+cf push -f manifest-node.yml --no-start
+cf set-env openclaw-node OPENCLAW_GATEWAY_TOKEN "<gateway-token>"
+cf set-env openclaw-node OPENCLAW_NODE_DEVICE_PUBLIC_KEY "-----BEGIN PUBLIC KEY-----..."
+cf set-env openclaw-node OPENCLAW_NODE_DEVICE_PRIVATE_KEY "-----BEGIN PRIVATE KEY-----..."
+
+# Add network policy for container-to-container communication
+cf add-network-policy openclaw-node openclaw --port 8081 --protocol tcp
+
+# Start the node
+cf start openclaw-node
+```
+
+#### 4. Verify connection
+
+```bash
+cf logs openclaw-node --recent
+# Should show: "Gateway is reachable!" and stable connection
+```
+
+### Quick Deploy with deploy.sh
+
+Use option 8 in the interactive menu:
+
+```bash
+./deploy.sh
+# Select: 8) Deploy node (system.run capability)
+```
+
+This automates token retrieval and network policy setup.
+
 ## Interactive Deployment
 
 Use `deploy.sh` for guided setup:
@@ -163,7 +239,8 @@ Options:
 5. **Enable SSO** - Setup p-identity SSO
 6. **Set gateway token** - Configure persistent auth token
 7. **Set manual API keys** - Alternative to GenAI service (uses cloud APIs directly)
-8. **Show app info** - Display status, services, and env vars
+8. **Deploy node** - Deploy a node for system.run capabilities
+9. **Show app info** - Display status, services, and env vars
 
 ## Configuration Reference
 
@@ -177,6 +254,11 @@ Options:
 | `OPENCLAW_STATE_DIR` | No | Data directory (default: `/home/vcap/app/data`) |
 | `ANTHROPIC_API_KEY` | No | Manual Anthropic API key (alternative to GenAI service) |
 | `OPENAI_API_KEY` | No | Manual OpenAI API key (alternative to GenAI service) |
+| `OPENCLAW_NODE_DEVICE_PUBLIC_KEY` | For node | Ed25519 public key (PEM) for node auto-pairing |
+| `OPENCLAW_NODE_DEVICE_PRIVATE_KEY` | For node | Ed25519 private key (PEM) for node identity |
+| `OPENCLAW_NODE_DEVICE_NAME` | No | Display name for the node (default: `cf-node`) |
+| `OPENCLAW_GATEWAY_HOST` | For node | Gateway hostname (default: `openclaw.apps.internal`) |
+| `OPENCLAW_GATEWAY_PORT` | For node | Gateway port (default: `8081`) |
 
 ### Services
 
