@@ -319,6 +319,35 @@ if [ -f "package.json" ]; then
 fi
 export OPENCLAW_VERSION
 
+# ============================================================
+# NFS Volume Detection (Persistent Storage)
+# ============================================================
+# If an NFS volume service is bound, auto-detect the mount path and use it
+# for OPENCLAW_STATE_DIR so state persists across restages/restarts.
+# Binding the service is the opt-in — no extra env var needed.
+if [ -n "$VCAP_SERVICES" ]; then
+    NFS_MOUNT=$(node -e "
+const vcap = JSON.parse(process.env.VCAP_SERVICES || '{}');
+const nfsBindings = vcap['nfs'] || vcap['smb'] || [];
+const mount = nfsBindings[0]?.volume_mounts?.[0]?.container_dir;
+if (mount) process.stdout.write(mount);
+" 2>/dev/null)
+
+    if [ -n "$NFS_MOUNT" ]; then
+        echo ""
+        echo "=== NFS Persistent Storage ==="
+        echo "  Volume mount detected: ${NFS_MOUNT}"
+        # Only override if OPENCLAW_STATE_DIR wasn't explicitly set by the user
+        if [ "${OPENCLAW_STATE_DIR}" = "/home/vcap/app/data" ] || [ -z "${OPENCLAW_STATE_DIR_SET_BY_USER}" ]; then
+            export OPENCLAW_STATE_DIR="${NFS_MOUNT}/openclaw"
+            mkdir -p "$OPENCLAW_STATE_DIR"
+            echo "  OPENCLAW_STATE_DIR set to: ${OPENCLAW_STATE_DIR}"
+        else
+            echo "  OPENCLAW_STATE_DIR already set to: ${OPENCLAW_STATE_DIR} (not overriding)"
+        fi
+    fi
+fi
+
 # Export the gateway token if it was auto-generated (make it available to start.sh)
 if [ -z "$OPENCLAW_GATEWAY_TOKEN" ]; then
     # Read the token back from the generated config

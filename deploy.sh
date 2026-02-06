@@ -260,6 +260,71 @@ setup_secrets() {
     echo "Add 'openclaw-secrets' to the services list in your manifest, then restage."
 }
 
+# Setup NFS persistent storage
+setup_nfs() {
+    local app_name="${1:-$APP_NAME}"
+
+    echo -e "\n${CYAN}=== NFS Persistent Storage Setup ===${NC}"
+    echo "Bind an NFS volume to persist OpenClaw state (chat history, device pairings,"
+    echo "workspace data) across restages and restarts."
+    echo ""
+    echo -e "${YELLOW}Prerequisites:${NC}"
+    echo "  - NFS volume services must be enabled on your CF foundation"
+    echo "  - An NFS server share must be available"
+    echo ""
+
+    # Check if NFS service type is available
+    if ! cf marketplace 2>/dev/null | grep -qE "^nfs\b"; then
+        echo -e "${RED}Error: NFS volume service not found in marketplace.${NC}"
+        echo "Ask your platform operator to install the NFS Volume Service broker."
+        echo "See: https://docs.cloudfoundry.org/devguide/services/using-vol-services.html"
+        return 1
+    fi
+
+    local SVC_NAME="openclaw-storage"
+
+    if cf service "$SVC_NAME" &>/dev/null; then
+        echo -e "${GREEN}Service '${SVC_NAME}' already exists.${NC}"
+        read -p "Delete and recreate? (y/N): " recreate
+        if [ "$recreate" = "y" ] || [ "$recreate" = "Y" ]; then
+            cf unbind-service "$app_name" "$SVC_NAME" 2>/dev/null || true
+            cf delete-service "$SVC_NAME" -f
+            echo "Waiting for service deletion..."
+            sleep 5
+        else
+            echo "Keeping existing service."
+            return 0
+        fi
+    fi
+
+    echo -e "${YELLOW}Available NFS plans:${NC}"
+    cf marketplace -e nfs 2>/dev/null || echo "(Could not list plans)"
+    echo ""
+
+    read -p "Enter NFS share path (e.g., nfs-server.example.com/exports/openclaw): " nfs_share
+    if [ -z "$nfs_share" ]; then
+        echo "No share path provided, skipping NFS setup."
+        return 0
+    fi
+
+    read -p "Enter NFS plan name (default: Existing): " nfs_plan
+    nfs_plan="${nfs_plan:-Existing}"
+
+    echo -e "${YELLOW}Creating NFS service instance...${NC}"
+    cf create-service nfs "$nfs_plan" "$SVC_NAME" -c "{\"share\":\"${nfs_share}\"}"
+
+    echo -e "${YELLOW}Binding to ${app_name} with volume mount...${NC}"
+    cf bind-service "$app_name" "$SVC_NAME" -c '{"uid":"vcap","gid":"vcap","mount":"/home/vcap/app/data/persistent"}'
+
+    echo -e "\n${GREEN}NFS storage configured!${NC}"
+    echo "  Service: ${SVC_NAME}"
+    echo "  Share: ${nfs_share}"
+    echo "  Mount path: /home/vcap/app/data/persistent"
+    echo "  OPENCLAW_STATE_DIR will auto-detect the mount on next restage."
+    echo ""
+    echo "Restage to apply: cf restage ${app_name}"
+}
+
 # Show app info
 show_info() {
     echo -e "\n${GREEN}=== Application Status ===${NC}"
@@ -629,14 +694,15 @@ main() {
     echo "  8) Deploy node (system.run capability)"
     echo "  9) Scale nodes"
     echo " 10) Setup secrets service (CredHub)"
-    echo " 11) Show app info"
+    echo " 11) Setup NFS persistent storage"
+    echo " 12) Show app info"
     echo ""
     echo -e "${CYAN}Multi-User:${NC}"
-    echo " 12) Create user instance"
-    echo " 13) Destroy user instance"
-    echo " 14) List all instances"
+    echo " 13) Create user instance"
+    echo " 14) Destroy user instance"
+    echo " 15) List all instances"
     echo ""
-    read -p "Enter choice [1-14]: " choice
+    read -p "Enter choice [1-15]: " choice
 
     case $choice in
         1) full_setup ;;
@@ -649,10 +715,11 @@ main() {
         8) deploy_node ;;
         9) scale_nodes ;;
         10) setup_secrets ;;
-        11) show_info ;;
-        12) create_instance ;;
-        13) destroy_instance ;;
-        14) list_instances ;;
+        11) setup_nfs ;;
+        12) show_info ;;
+        13) create_instance ;;
+        14) destroy_instance ;;
+        15) list_instances ;;
         *)
             echo -e "${RED}Invalid choice${NC}"
             exit 1

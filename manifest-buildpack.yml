@@ -72,3 +72,4 @@ applications:
       - tanzu-all-models
       - openclaw-sso
       # - openclaw-secrets  # User-provided service with gateway_token, node_seed, cookie_secret
+      # - openclaw-storage  # NFS volume service for persistent state (chat history, pairings)

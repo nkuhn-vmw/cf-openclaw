@@ -284,6 +284,38 @@ cf restage openclaw
 
 The `.profile` script automatically extracts secrets from the `openclaw-secrets` service binding. These take precedence over env vars.
 
+## Persistent Storage with NFS (Optional)
+
+By default, OpenClaw state (chat history, device pairings, workspace data) is stored in the container's ephemeral filesystem and lost on restage or crash. Bind an NFS volume service to persist this data.
+
+### Prerequisites
+
+- NFS Volume Services broker installed on your CF foundation
+- An NFS server share accessible from the CF cells
+
+### Setup
+
+```bash
+# 1. Create an NFS service instance
+cf create-service nfs Existing openclaw-storage -c '{"share":"nfs-server.example.com/exports/openclaw"}'
+
+# 2. Bind with volume mount
+cf bind-service openclaw openclaw-storage -c '{"uid":"vcap","gid":"vcap","mount":"/home/vcap/app/data/persistent"}'
+
+# 3. Restage to mount the volume
+cf restage openclaw
+
+# Or use deploy.sh:
+./deploy.sh
+# Select: 11) Setup NFS persistent storage
+```
+
+The `.profile` script auto-detects the NFS mount from `VCAP_SERVICES` and sets `OPENCLAW_STATE_DIR` to point to it. No additional configuration needed.
+
+### Without NFS
+
+If NFS is not available on your foundation, state is ephemeral. This is fine for single-user setups where chat history isn't critical. Templates and configuration are regenerated from env vars on each startup.
+
 ## Multi-User Deployment
 
 Provision isolated gateway+node instances per user or team using `deploy.sh`:
@@ -328,12 +360,13 @@ Use `deploy.sh` for guided setup:
 8. **Deploy node** - Deploy a node for system.run capabilities
 9. **Scale nodes** - Scale node instances up or down
 10. **Setup secrets service** - Store secrets in CredHub/user-provided service
-11. **Show app info** - Display status, services, and env vars
+11. **Setup NFS persistent storage** - Bind NFS volume for persistent state
+12. **Show app info** - Display status, services, and env vars
 
 **Multi-User:**
-12. **Create user instance** - Provision isolated gateway+node per user
-13. **Destroy user instance** - Tear down a user's instance
-14. **List all instances** - Show all deployed OpenClaw apps
+13. **Create user instance** - Provision isolated gateway+node per user
+14. **Destroy user instance** - Tear down a user's instance
+15. **List all instances** - Show all deployed OpenClaw apps
 
 CLI subcommands are also supported:
 
@@ -371,6 +404,7 @@ CLI subcommands are also supported:
 | `openclaw-genai` | `genai` | LLM model from CF marketplace |
 | `openclaw-sso` | `p-identity` | SSO authentication |
 | `openclaw-secrets` | `user-provided` | Centralized secrets (gateway_token, node_seed, cookie_secret) |
+| `openclaw-storage` | `nfs` | Persistent volume for state data (optional) |
 
 ## Security Notes
 
@@ -384,6 +418,7 @@ CLI subcommands are also supported:
 - Cloud Foundry with Node.js buildpack (Node 22+ support)
 - GenAI service broker (for LLM integration)
 - SSO tile / p-identity service (for SSO, optional)
+- NFS Volume Services broker (for persistent storage, optional)
 - 2GB+ memory allocation
 - 4GB+ disk quota (for buildpack deployment)
 
