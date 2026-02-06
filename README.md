@@ -8,6 +8,9 @@ Deploy [OpenClaw](https://github.com/openclaw/openclaw) to Cloud Foundry with au
 - **SSO Authentication**: Optional oauth2-proxy sidecar using CF's p-identity SSO service
 - **Gateway Auth**: Mandatory token-based authentication for the OpenClaw gateway
 - **Node Deployment**: Deploy nodes for system.run capabilities with auto-pairing via container-to-container networking
+- **Multi-Instance Scaling**: Scale nodes horizontally with `cf scale` using deterministic seed-based keypair derivation
+- **Secrets Service**: Optional CredHub/user-provided service for centralized secret management
+- **Multi-User Deployment**: Provision isolated gateway+node instances per user or team
 - **Dual Format Support**: Works with both deprecated single-model and new multi-model GenAI credential formats
 
 ## Files
@@ -163,40 +166,35 @@ Gateway (openclaw) ←── internal networking ──→ Node (openclaw-node)
 
 The node connects to the gateway via CF container-to-container networking using an internal route.
 
-### Setup
+### Setup (Seed-Based - Recommended)
 
-#### 1. Generate a device keypair
+The seed-based approach uses a single shared secret to derive Ed25519 keypairs deterministically on both gateway and node. No external key generation needed.
 
-```bash
-node -e "const c=require('crypto');const k=c.generateKeyPairSync('ed25519');console.log(k.publicKey.export({type:'spki',format:'pem'}));console.log(k.privateKey.export({type:'pkcs8',format:'pem'}))"
-```
-
-Save both keys - they're needed for auto-pairing.
-
-#### 2. Configure the gateway with the node's public key
+#### 1. Generate a shared seed and set on both apps
 
 ```bash
-cf set-env openclaw OPENCLAW_NODE_DEVICE_PUBLIC_KEY "-----BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEA...
------END PUBLIC KEY-----"
+# Generate a random seed
+SEED=$(openssl rand -hex 16)
+
+# Set on gateway (pre-registers the node's derived public key)
+cf set-env openclaw OPENCLAW_NODE_SEED "$SEED"
 cf restage openclaw
+
+# Set on node (derives the matching keypair for authentication)
+cf set-env openclaw-node OPENCLAW_NODE_SEED "$SEED"
 ```
 
-#### 3. Deploy the node
+#### 2. Deploy the node
 
 ```bash
 # Copy node deployment files to openclaw source directory
 cp manifest-node.yml start-node.sh /path/to/openclaw/
 
-# Get the gateway token
-cf logs openclaw --recent | grep "Token:"
-
 # Deploy and configure
 cd /path/to/openclaw
 cf push -f manifest-node.yml --no-start
 cf set-env openclaw-node OPENCLAW_GATEWAY_TOKEN "<gateway-token>"
-cf set-env openclaw-node OPENCLAW_NODE_DEVICE_PUBLIC_KEY "-----BEGIN PUBLIC KEY-----..."
-cf set-env openclaw-node OPENCLAW_NODE_DEVICE_PRIVATE_KEY "-----BEGIN PRIVATE KEY-----..."
+cf set-env openclaw-node OPENCLAW_NODE_SEED "$SEED"
 
 # Add network policy for container-to-container communication
 cf add-network-policy openclaw-node openclaw --port 8081 --protocol tcp
@@ -205,12 +203,57 @@ cf add-network-policy openclaw-node openclaw --port 8081 --protocol tcp
 cf start openclaw-node
 ```
 
-#### 4. Verify connection
+#### 3. Verify connection
 
 ```bash
 cf logs openclaw-node --recent
-# Should show: "Gateway is reachable!" and stable connection
+# Should show: "Setting up device identity from seed..." and "Gateway is reachable!"
 ```
+
+### Setup (Legacy PEM Keys)
+
+<details>
+<summary>Alternative approach using explicit Ed25519 PEM keypairs</summary>
+
+```bash
+# 1. Generate a keypair
+node -e "const c=require('crypto');const k=c.generateKeyPairSync('ed25519');console.log(k.publicKey.export({type:'spki',format:'pem'}));console.log(k.privateKey.export({type:'pkcs8',format:'pem'}))"
+
+# 2. Set public key on gateway
+cf set-env openclaw OPENCLAW_NODE_DEVICE_PUBLIC_KEY "-----BEGIN PUBLIC KEY-----..."
+cf restage openclaw
+
+# 3. Set both keys on node
+cf set-env openclaw-node OPENCLAW_NODE_DEVICE_PUBLIC_KEY "-----BEGIN PUBLIC KEY-----..."
+cf set-env openclaw-node OPENCLAW_NODE_DEVICE_PRIVATE_KEY "-----BEGIN PRIVATE KEY-----..."
+
+# 4. Deploy node, add network policy, start
+cf push -f manifest-node.yml --no-start
+cf set-env openclaw-node OPENCLAW_GATEWAY_TOKEN "<gateway-token>"
+cf add-network-policy openclaw-node openclaw --port 8081 --protocol tcp
+cf start openclaw-node
+```
+
+</details>
+
+### Multi-Instance Node Scaling
+
+Scale nodes horizontally using the seed-based approach. Each CF instance derives a unique keypair from `OPENCLAW_NODE_SEED + ":" + CF_INSTANCE_INDEX`.
+
+```bash
+# 1. Set the max instances on the gateway (pre-registers N keypairs)
+cf set-env openclaw OPENCLAW_NODE_MAX_INSTANCES 5
+cf restage openclaw
+
+# 2. Scale the node app
+cf scale openclaw-node -i 5
+
+# Or use deploy.sh:
+./deploy.sh
+# Select: 9) Scale nodes
+```
+
+Each instance appears in the gateway with a unique name (`cf-node-0`, `cf-node-1`, etc.).
 
 ### Quick Deploy with deploy.sh
 
@@ -223,6 +266,49 @@ Use option 8 in the interactive menu:
 
 This automates token retrieval and network policy setup.
 
+## Secrets Service (Optional)
+
+Store gateway token, node seed, and cookie secret in a CF user-provided service instead of plain env vars. Secrets are stored in CF's credential store and injected via `VCAP_SERVICES`.
+
+```bash
+# Create the secrets service (auto-generates token and seed)
+./deploy.sh
+# Select: 10) Setup secrets service (CredHub)
+
+# Or manually:
+cf create-user-provided-service openclaw-secrets -p '{"gateway_token":"...","node_seed":"...","cookie_secret":"..."}'
+cf bind-service openclaw openclaw-secrets
+cf bind-service openclaw-node openclaw-secrets
+cf restage openclaw
+```
+
+The `.profile` script automatically extracts secrets from the `openclaw-secrets` service binding. These take precedence over env vars.
+
+## Multi-User Deployment
+
+Provision isolated gateway+node instances per user or team using `deploy.sh`:
+
+```bash
+# Create an instance (auto-generates secrets, sets up networking)
+./deploy.sh create-instance --name alice
+
+# Or interactively:
+./deploy.sh
+# Select: 12) Create user instance
+
+# List all instances
+./deploy.sh list-instances
+
+# Destroy an instance
+./deploy.sh destroy-instance --name alice
+```
+
+Each instance gets:
+- Gateway app: `openclaw-alice`
+- Node app: `openclaw-node-alice`
+- Auto-generated gateway token and node seed
+- Internal networking and c2c policy
+
 ## Interactive Deployment
 
 Use `deploy.sh` for guided setup:
@@ -231,7 +317,7 @@ Use `deploy.sh` for guided setup:
 ./deploy.sh
 ```
 
-Options:
+**Single Instance:**
 1. **Full setup** - Creates GenAI service, sets gateway token, deploys, optional SSO
 2. **Deploy with buildpack** - Just deploys the app
 3. **Deploy with Docker** - Alternative Docker deployment
@@ -240,7 +326,22 @@ Options:
 6. **Set gateway token** - Configure persistent auth token
 7. **Set manual API keys** - Alternative to GenAI service (uses cloud APIs directly)
 8. **Deploy node** - Deploy a node for system.run capabilities
-9. **Show app info** - Display status, services, and env vars
+9. **Scale nodes** - Scale node instances up or down
+10. **Setup secrets service** - Store secrets in CredHub/user-provided service
+11. **Show app info** - Display status, services, and env vars
+
+**Multi-User:**
+12. **Create user instance** - Provision isolated gateway+node per user
+13. **Destroy user instance** - Tear down a user's instance
+14. **List all instances** - Show all deployed OpenClaw apps
+
+CLI subcommands are also supported:
+
+```bash
+./deploy.sh create-instance --name alice
+./deploy.sh destroy-instance --name alice
+./deploy.sh list-instances
+```
 
 ## Configuration Reference
 
@@ -249,13 +350,16 @@ Options:
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `OPENCLAW_GATEWAY_TOKEN` | Recommended | Fixed auth token for gateway. Auto-generated if not set. |
+| `OPENCLAW_NODE_SEED` | For node | Shared seed for deterministic keypair derivation (recommended) |
+| `OPENCLAW_NODE_MAX_INSTANCES` | No | Number of node instance keypairs to pre-register (default: `1`) |
+| `OPENCLAW_PINNED_VERSION` | No | Expected OpenClaw version; warns on mismatch to protect against format changes |
 | `OPENCLAW_SSO_ENABLED` | No | Set to `true` to enable SSO proxy |
 | `OPENCLAW_COOKIE_SECRET` | If SSO | Base64-encoded secret for SSO session cookies |
 | `OPENCLAW_STATE_DIR` | No | Data directory (default: `/home/vcap/app/data`) |
 | `ANTHROPIC_API_KEY` | No | Manual Anthropic API key (alternative to GenAI service) |
 | `OPENAI_API_KEY` | No | Manual OpenAI API key (alternative to GenAI service) |
-| `OPENCLAW_NODE_DEVICE_PUBLIC_KEY` | For node | Ed25519 public key (PEM) for node auto-pairing |
-| `OPENCLAW_NODE_DEVICE_PRIVATE_KEY` | For node | Ed25519 private key (PEM) for node identity |
+| `OPENCLAW_NODE_DEVICE_PUBLIC_KEY` | Legacy | Ed25519 public key (PEM) for node auto-pairing |
+| `OPENCLAW_NODE_DEVICE_PRIVATE_KEY` | Legacy | Ed25519 private key (PEM) for node identity |
 | `OPENCLAW_NODE_DEVICE_NAME` | No | Display name for the node (default: `cf-node`) |
 | `OPENCLAW_GATEWAY_HOST` | For node | Gateway hostname (default: `openclaw.apps.internal`) |
 | `OPENCLAW_GATEWAY_PORT` | For node | Gateway port (default: `8081`) |
@@ -266,6 +370,7 @@ Options:
 |---------|------|---------|
 | `openclaw-genai` | `genai` | LLM model from CF marketplace |
 | `openclaw-sso` | `p-identity` | SSO authentication |
+| `openclaw-secrets` | `user-provided` | Centralized secrets (gateway_token, node_seed, cookie_secret) |
 
 ## Security Notes
 

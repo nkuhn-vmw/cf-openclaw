@@ -27,6 +27,9 @@ applications:
       OPENCLAW_A2UI_SKIP_MISSING: "1"
       # State directory
       OPENCLAW_STATE_DIR: /home/vcap/app/data
+      # --- Version Pinning ---
+      # Warn if OpenClaw version changes (protects paired.json format assumptions)
+      # OPENCLAW_PINNED_VERSION: "2026.1.29"
 
       # --- Gateway Authentication ---
       # Set a fixed token for connecting clients.
@@ -44,8 +47,14 @@ applications:
       # OPENAI_API_KEY: (set via cf set-env)
 
       # --- Node Auto-Pairing ---
-      # Pre-register the CF node's device identity so it can connect without manual approval.
-      # Generate a keypair and set via cf set-env (do not commit keys to git):
+      # Option 1 (recommended): Shared seed - set on BOTH gateway and node.
+      # Derives Ed25519 keypair deterministically. Supports multi-instance scaling.
+      #   cf set-env openclaw OPENCLAW_NODE_SEED "$(openssl rand -hex 16)"
+      #   cf set-env openclaw-node OPENCLAW_NODE_SEED "<same value as above>"
+      # OPENCLAW_NODE_SEED: (set via cf set-env on both gateway and node)
+      # OPENCLAW_NODE_MAX_INSTANCES: "1"  # Pre-register N instance keypairs for scaling
+      #
+      # Option 2 (legacy): Explicit PEM keypair
       #   node -e "const c=require('crypto');const k=c.generateKeyPairSync('ed25519');console.log(k.publicKey.export({type:'spki',format:'pem'}));console.log(k.privateKey.export({type:'pkcs8',format:'pem'}))"
       #   cf set-env openclaw OPENCLAW_NODE_DEVICE_PUBLIC_KEY "-----BEGIN PUBLIC KEY-----..."
       #   cf set-env openclaw-node OPENCLAW_NODE_DEVICE_PUBLIC_KEY "-----BEGIN PUBLIC KEY-----..."
@@ -62,3 +71,4 @@ applications:
     services:
       - tanzu-all-models
       - openclaw-sso
+      # - openclaw-secrets  # User-provided service with gateway_token, node_seed, cookie_secret

@@ -211,6 +211,55 @@ set_api_keys() {
     fi
 }
 
+# Setup CredHub secrets service
+setup_secrets() {
+    local app_name="${1:-$APP_NAME}"
+    local svc_name="openclaw-secrets"
+
+    echo -e "\n${CYAN}=== Secrets Service Setup ===${NC}"
+    echo "Creates a user-provided service with gateway token, node seed, and cookie secret."
+    echo "These are stored in CF's credential store rather than plain env vars."
+    echo ""
+
+    if cf service "$svc_name" &>/dev/null; then
+        echo -e "${GREEN}Service '${svc_name}' already exists.${NC}"
+        read -p "Delete and recreate? (y/N): " recreate
+        if [ "$recreate" = "y" ] || [ "$recreate" = "Y" ]; then
+            cf unbind-service "$app_name" "$svc_name" 2>/dev/null || true
+            cf delete-service "$svc_name" -f
+        else
+            echo "Keeping existing service."
+            return 0
+        fi
+    fi
+
+    # Generate or prompt for secrets
+    local gw_token node_seed cookie_secret
+
+    read -p "Enter gateway token (or press Enter to auto-generate): " gw_token
+    gw_token="${gw_token:-$(openssl rand -hex 32)}"
+
+    read -p "Enter node seed (or press Enter to auto-generate): " node_seed
+    node_seed="${node_seed:-$(openssl rand -hex 16)}"
+
+    cookie_secret=$(openssl rand -base64 32)
+
+    echo -e "${YELLOW}Creating secrets service...${NC}"
+    cf create-user-provided-service "$svc_name" -p "{\"gateway_token\":\"${gw_token}\",\"node_seed\":\"${node_seed}\",\"cookie_secret\":\"${cookie_secret}\"}"
+
+    echo -e "${YELLOW}Binding to ${app_name}...${NC}"
+    cf bind-service "$app_name" "$svc_name" 2>/dev/null || {
+        echo -e "${YELLOW}App not yet deployed. Add 'openclaw-secrets' to services in manifest.${NC}"
+    }
+
+    echo -e "${GREEN}Secrets service configured!${NC}"
+    echo "  Gateway token: ${gw_token:0:8}..."
+    echo "  Node seed: ${node_seed:0:8}..."
+    echo "  Cookie secret: (auto-generated)"
+    echo ""
+    echo "Add 'openclaw-secrets' to the services list in your manifest, then restage."
+}
+
 # Show app info
 show_info() {
     echo -e "\n${GREEN}=== Application Status ===${NC}"
@@ -330,21 +379,264 @@ deploy_node() {
     echo "Once connected, the node provides system.run capabilities to agents."
 }
 
+# Scale node instances up or down
+scale_nodes() {
+    local NODE_APP="openclaw-node"
+
+    echo -e "\n${CYAN}=== Scale Node Instances ===${NC}"
+
+    if ! cf app "$NODE_APP" &>/dev/null; then
+        echo -e "${RED}Error: Node app '$NODE_APP' not found.${NC}"
+        echo "Deploy the node first using option 8."
+        return 1
+    fi
+
+    echo -e "${YELLOW}Current node status:${NC}"
+    cf app "$NODE_APP" | grep -E "(instances|running|crashed)"
+    echo ""
+
+    read -p "Enter desired number of instances: " num_instances
+    if ! [[ "$num_instances" =~ ^[0-9]+$ ]] || [ "$num_instances" -lt 0 ]; then
+        echo -e "${RED}Invalid number. Must be >= 0.${NC}"
+        return 1
+    fi
+
+    if [ "$num_instances" -eq 0 ]; then
+        echo -e "${YELLOW}Stopping all node instances...${NC}"
+        cf stop "$NODE_APP"
+        echo -e "${GREEN}Node stopped.${NC}"
+        return 0
+    fi
+
+    # Check if seed is configured (required for multi-instance)
+    if [ "$num_instances" -gt 1 ]; then
+        local has_seed
+        has_seed=$(cf env "$NODE_APP" 2>/dev/null | grep "OPENCLAW_NODE_SEED" || true)
+        if [ -z "$has_seed" ]; then
+            echo -e "${RED}Error: OPENCLAW_NODE_SEED is required for multi-instance scaling.${NC}"
+            echo "Set it on both gateway and node:"
+            echo "  cf set-env $APP_NAME OPENCLAW_NODE_SEED \"\$(openssl rand -hex 16)\""
+            echo "  cf set-env $NODE_APP OPENCLAW_NODE_SEED \"<same value>\""
+            return 1
+        fi
+    fi
+
+    # Update gateway's max instances if needed
+    local max_registered
+    max_registered=$(cf env "$APP_NAME" 2>/dev/null | grep "OPENCLAW_NODE_MAX_INSTANCES" | awk -F: '{print $2}' | tr -d ' "' || echo "")
+
+    if [ -z "$max_registered" ] || [ "$max_registered" -lt "$num_instances" ] 2>/dev/null; then
+        echo -e "${YELLOW}Gateway needs to register ${num_instances} node keypair(s).${NC}"
+        echo "Setting OPENCLAW_NODE_MAX_INSTANCES=${num_instances} on gateway..."
+        cf set-env "$APP_NAME" OPENCLAW_NODE_MAX_INSTANCES "$num_instances"
+        echo -e "${YELLOW}Restaging gateway to register new device keypairs...${NC}"
+        cf restage "$APP_NAME"
+    fi
+
+    echo -e "${CYAN}Scaling node to ${num_instances} instance(s)...${NC}"
+    cf scale "$NODE_APP" -i "$num_instances"
+
+    echo -e "\n${GREEN}Node scaled to ${num_instances} instance(s)!${NC}"
+    echo "Each instance derives a unique identity from the shared seed + CF_INSTANCE_INDEX."
+    echo "Check status: cf app $NODE_APP"
+}
+
+# Parse --name flag from args
+parse_instance_name() {
+    local name=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name) name="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    echo "$name"
+}
+
+# Create isolated instance for a user/team
+create_instance() {
+    local instance_name="$1"
+    if [ -z "$instance_name" ]; then
+        read -p "Enter instance name (e.g., alice, team-alpha): " instance_name
+    fi
+    if [ -z "$instance_name" ]; then
+        echo -e "${RED}Instance name is required.${NC}"
+        return 1
+    fi
+
+    local GW_APP="openclaw-${instance_name}"
+    local NODE_APP="openclaw-node-${instance_name}"
+    local GENAI_SVC="openclaw-genai-${instance_name}"
+
+    echo -e "\n${CYAN}=== Creating Instance: ${instance_name} ===${NC}"
+    echo "  Gateway app:  ${GW_APP}"
+    echo "  Node app:     ${NODE_APP}"
+    echo ""
+
+    # Auto-generate secrets
+    local SEED=$(openssl rand -hex 16)
+    local TOKEN=$(openssl rand -hex 32)
+
+    echo -e "${YELLOW}Generated secrets:${NC}"
+    echo "  Node Seed: ${SEED:0:8}..."
+    echo "  Gateway Token: ${TOKEN:0:8}..."
+
+    # Check if we're in openclaw source dir
+    if [ ! -f "package.json" ]; then
+        echo -e "${RED}Error: Must run from OpenClaw source directory${NC}"
+        return 1
+    fi
+
+    # GenAI service - shared or dedicated
+    read -p "Create dedicated GenAI service for ${instance_name}? (y/N, N = use existing shared): " create_genai
+    if [ "$create_genai" = "y" ] || [ "$create_genai" = "Y" ]; then
+        echo -e "${YELLOW}Available GenAI plans:${NC}"
+        cf marketplace -e genai 2>/dev/null || true
+        read -p "Enter GenAI plan name: " genai_plan
+        if [ -n "$genai_plan" ]; then
+            cf create-service genai "$genai_plan" "$GENAI_SVC"
+        fi
+    else
+        read -p "Enter existing GenAI service name to share (default: tanzu-all-models): " shared_svc
+        GENAI_SVC="${shared_svc:-tanzu-all-models}"
+    fi
+
+    # Deploy gateway (override app name from CLI, use --no-route to avoid hardcoded route)
+    echo -e "\n${CYAN}Deploying gateway: ${GW_APP}${NC}"
+    cf push "$GW_APP" -f manifest-buildpack.yml --no-start --no-route
+    cf map-route "$GW_APP" apps.internal --hostname "$GW_APP"
+
+    # Try to detect the apps domain and create an external route
+    local APPS_DOMAIN
+    APPS_DOMAIN=$(cf routes 2>/dev/null | awk 'NR>3 && $2 ~ /apps\./ {print $2; exit}' || echo "")
+    if [ -n "$APPS_DOMAIN" ]; then
+        cf map-route "$GW_APP" "$APPS_DOMAIN" --hostname "$GW_APP"
+        echo -e "${GREEN}External route: ${GW_APP}.${APPS_DOMAIN}${NC}"
+    fi
+
+    cf set-env "$GW_APP" OPENCLAW_GATEWAY_TOKEN "$TOKEN"
+    cf set-env "$GW_APP" OPENCLAW_NODE_SEED "$SEED"
+    cf set-env "$GW_APP" OPENCLAW_NODE_MAX_INSTANCES "1"
+    cf bind-service "$GW_APP" "$GENAI_SVC" 2>/dev/null || {
+        echo -e "${YELLOW}Warning: Could not bind GenAI service '${GENAI_SVC}'.${NC}"
+    }
+    cf start "$GW_APP"
+
+    # Deploy node
+    echo -e "\n${CYAN}Deploying node: ${NODE_APP}${NC}"
+    cf push "$NODE_APP" -f manifest-node.yml --no-start --no-route
+    cf map-route "$NODE_APP" apps.internal --hostname "$NODE_APP"
+    cf set-env "$NODE_APP" OPENCLAW_GATEWAY_TOKEN "$TOKEN"
+    cf set-env "$NODE_APP" OPENCLAW_NODE_SEED "$SEED"
+    cf set-env "$NODE_APP" OPENCLAW_GATEWAY_HOST "${GW_APP}.apps.internal"
+    cf set-env "$NODE_APP" OPENCLAW_NODE_NAME "cf-node-${instance_name}"
+
+    # Network policy
+    echo -e "${YELLOW}Adding network policy...${NC}"
+    cf add-network-policy "$NODE_APP" "$GW_APP" --port 8081 --protocol tcp || true
+    cf start "$NODE_APP"
+
+    echo -e "\n${GREEN}Instance '${instance_name}' deployed!${NC}"
+    echo "  Gateway: ${GW_APP}"
+    echo "  Node: ${NODE_APP}"
+    echo "  Token: ${TOKEN}"
+    if [ -n "$APPS_DOMAIN" ]; then
+        echo "  URL: https://${GW_APP}.${APPS_DOMAIN}"
+    fi
+}
+
+# Destroy an instance
+destroy_instance() {
+    local instance_name="$1"
+    if [ -z "$instance_name" ]; then
+        read -p "Enter instance name to destroy: " instance_name
+    fi
+    if [ -z "$instance_name" ]; then
+        echo -e "${RED}Instance name is required.${NC}"
+        return 1
+    fi
+
+    local GW_APP="openclaw-${instance_name}"
+    local NODE_APP="openclaw-node-${instance_name}"
+    local GENAI_SVC="openclaw-genai-${instance_name}"
+
+    echo -e "\n${RED}=== Destroying Instance: ${instance_name} ===${NC}"
+    echo "  This will delete: ${GW_APP}, ${NODE_APP}"
+    read -p "Are you sure? (y/N): " confirm
+    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+        echo "Cancelled."
+        return
+    fi
+
+    cf remove-network-policy "$NODE_APP" "$GW_APP" --port 8081 --protocol tcp 2>/dev/null || true
+    cf delete "$NODE_APP" -f 2>/dev/null || true
+    cf delete "$GW_APP" -f 2>/dev/null || true
+
+    # Optionally delete dedicated GenAI service
+    if cf service "$GENAI_SVC" &>/dev/null; then
+        read -p "Delete dedicated GenAI service '${GENAI_SVC}'? (y/N): " del_svc
+        if [ "$del_svc" = "y" ] || [ "$del_svc" = "Y" ]; then
+            cf delete-service "$GENAI_SVC" -f
+        fi
+    fi
+
+    echo -e "${GREEN}Instance '${instance_name}' destroyed.${NC}"
+}
+
+# List all deployed instances
+list_instances() {
+    echo -e "\n${CYAN}=== OpenClaw Instances ===${NC}"
+    echo ""
+    echo -e "${YELLOW}Gateway apps:${NC}"
+    cf apps 2>/dev/null | grep "^openclaw" | grep -v "node" || echo "  (none found)"
+    echo ""
+    echo -e "${YELLOW}Node apps:${NC}"
+    cf apps 2>/dev/null | grep "^openclaw-node" || echo "  (none found)"
+}
+
 # Main menu
 main() {
     check_prerequisites
 
+    # Support CLI subcommands: ./deploy.sh create-instance --name alice
+    case "${1:-}" in
+        create-instance)
+            shift
+            create_instance "$(parse_instance_name "$@")"
+            return
+            ;;
+        destroy-instance)
+            shift
+            destroy_instance "$(parse_instance_name "$@")"
+            return
+            ;;
+        list-instances)
+            list_instances
+            return
+            ;;
+    esac
+
     echo -e "\n${YELLOW}Select an option:${NC}"
-    echo "1) Full setup (recommended for first-time deployment)"
-    echo "2) Deploy with buildpack"
-    echo "3) Deploy with Docker"
-    echo "4) Create/bind GenAI service"
-    echo "5) Enable SSO"
-    echo "6) Set gateway token"
-    echo "7) Set manual API keys (alternative to GenAI)"
-    echo "8) Deploy node (system.run capability)"
-    echo "9) Show app info"
-    read -p "Enter choice [1-9]: " choice
+    echo ""
+    echo -e "${CYAN}Single Instance:${NC}"
+    echo "  1) Full setup (recommended for first-time deployment)"
+    echo "  2) Deploy with buildpack"
+    echo "  3) Deploy with Docker"
+    echo "  4) Create/bind GenAI service"
+    echo "  5) Enable SSO"
+    echo "  6) Set gateway token"
+    echo "  7) Set manual API keys (alternative to GenAI)"
+    echo "  8) Deploy node (system.run capability)"
+    echo "  9) Scale nodes"
+    echo " 10) Setup secrets service (CredHub)"
+    echo " 11) Show app info"
+    echo ""
+    echo -e "${CYAN}Multi-User:${NC}"
+    echo " 12) Create user instance"
+    echo " 13) Destroy user instance"
+    echo " 14) List all instances"
+    echo ""
+    read -p "Enter choice [1-14]: " choice
 
     case $choice in
         1) full_setup ;;
@@ -355,7 +647,12 @@ main() {
         6) setup_gateway_token ;;
         7) set_api_keys ;;
         8) deploy_node ;;
-        9) show_info ;;
+        9) scale_nodes ;;
+        10) setup_secrets ;;
+        11) show_info ;;
+        12) create_instance ;;
+        13) destroy_instance ;;
+        14) list_instances ;;
         *)
             echo -e "${RED}Invalid choice${NC}"
             exit 1

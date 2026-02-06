@@ -9,6 +9,38 @@ SSO_ENV_FILE="${HOME}/sso.env"
 mkdir -p "$OPENCLAW_CONFIG_DIR"
 
 # ============================================================
+# 0. CredHub / Secrets Service Binding
+# ============================================================
+# If 'openclaw-secrets' user-provided service is bound, extract secrets
+# and export them as env vars. These take precedence over manually-set env vars.
+if [ -n "$VCAP_SERVICES" ]; then
+    SECRETS_ENV=$(node -e "
+const vcap = JSON.parse(process.env.VCAP_SERVICES || '{}');
+const binding = (vcap['user-provided'] || []).find(s => s.name === 'openclaw-secrets')?.credentials
+    || (vcap['credhub'] || []).find(s => s.name === 'openclaw-secrets')?.credentials;
+if (binding) {
+    const map = {
+        gateway_token: 'OPENCLAW_GATEWAY_TOKEN',
+        node_seed: 'OPENCLAW_NODE_SEED',
+        cookie_secret: 'OPENCLAW_COOKIE_SECRET',
+        node_max_instances: 'OPENCLAW_NODE_MAX_INSTANCES',
+        pinned_version: 'OPENCLAW_PINNED_VERSION'
+    };
+    for (const [key, envVar] of Object.entries(map)) {
+        if (binding[key]) {
+            console.log('export ' + envVar + '=\"' + String(binding[key]).replace(/\"/g, '\\\\\"') + '\"');
+        }
+    }
+}
+" 2>/dev/null)
+
+    if [ -n "$SECRETS_ENV" ]; then
+        echo "=== Secrets loaded from openclaw-secrets service ==="
+        eval "$SECRETS_ENV"
+    fi
+fi
+
+# ============================================================
 # 1. GenAI Service Configuration
 # ============================================================
 # Supports both credential formats:
@@ -258,6 +290,28 @@ fi
 # Export config path for OpenClaw
 export OPENCLAW_CONFIG_PATH="$OPENCLAW_CONFIG_FILE"
 
+# ============================================================
+# Version Detection & Pinning
+# ============================================================
+OPENCLAW_VERSION=""
+if [ -f "package.json" ]; then
+    OPENCLAW_VERSION=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('package.json','utf8')).version||'unknown')}catch(e){console.log('unknown')}" 2>/dev/null)
+    echo ""
+    echo "=== OpenClaw Version ==="
+    echo "  Detected: v${OPENCLAW_VERSION}"
+
+    if [ -n "$OPENCLAW_PINNED_VERSION" ]; then
+        if [ "$OPENCLAW_VERSION" != "$OPENCLAW_PINNED_VERSION" ]; then
+            echo "  WARNING: Version mismatch! Pinned: v${OPENCLAW_PINNED_VERSION}, Actual: v${OPENCLAW_VERSION}"
+            echo "  The paired.json format or config schema may have changed."
+            echo "  Update OPENCLAW_PINNED_VERSION if this is intentional."
+        else
+            echo "  Version matches pinned version."
+        fi
+    fi
+fi
+export OPENCLAW_VERSION
+
 # Export the gateway token if it was auto-generated (make it available to start.sh)
 if [ -z "$OPENCLAW_GATEWAY_TOKEN" ]; then
     # Read the token back from the generated config
@@ -272,14 +326,93 @@ fi
 # ============================================================
 # Pre-register CF Node Device for auto-pairing
 # ============================================================
-# When OPENCLAW_NODE_DEVICE_PUBLIC_KEY is set, pre-register the node's
-# device identity as paired so it can connect without manual approval.
-if [ -n "$OPENCLAW_NODE_DEVICE_PUBLIC_KEY" ]; then
+# Two approaches supported:
+#   1. OPENCLAW_NODE_SEED (recommended): Shared seed derives keypair deterministically.
+#      Set the same seed on both gateway and node. Supports multi-instance scaling.
+#   2. OPENCLAW_NODE_DEVICE_PUBLIC_KEY (legacy): PEM public key set explicitly.
+
+if [ -n "$OPENCLAW_NODE_SEED" ]; then
     echo ""
-    echo "=== Pre-registering Node Device ==="
+    echo "=== Pre-registering Node Device (seed-based) ==="
+    OPENCLAW_NODE_MAX_INSTANCES="${OPENCLAW_NODE_MAX_INSTANCES:-1}"
+    echo "  Seed length: ${#OPENCLAW_NODE_SEED}"
+    echo "  Max instances: ${OPENCLAW_NODE_MAX_INSTANCES}"
+    echo "  State dir: ${OPENCLAW_STATE_DIR:-$HOME/.openclaw}"
+
+    node -e "
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
+const seed = process.env.OPENCLAW_NODE_SEED;
+const maxInstances = parseInt(process.env.OPENCLAW_NODE_MAX_INSTANCES || '1', 10);
+const stateDir = process.env.OPENCLAW_STATE_DIR || path.join(process.env.HOME, '.openclaw');
+const devicesDir = path.join(stateDir, 'devices');
+const pairedPath = path.join(devicesDir, 'paired.json');
+const baseName = process.env.OPENCLAW_NODE_DEVICE_NAME || 'cf-node';
+
+// Ed25519 DER format prefixes
+const ED25519_PKCS8_PREFIX = Buffer.from('302e020100300506032b657004220420', 'hex');
+const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
+
+function deriveDeviceFromSeed(seedStr) {
+    const seedBytes = crypto.createHash('sha256').update(seedStr).digest();
+    const pkcs8Der = Buffer.concat([ED25519_PKCS8_PREFIX, seedBytes]);
+    const privateKey = crypto.createPrivateKey({ key: pkcs8Der, format: 'der', type: 'pkcs8' });
+    const publicKey = crypto.createPublicKey(privateKey);
+    const spki = publicKey.export({ type: 'spki', format: 'der' });
+    const rawPublicKey = spki.subarray(ED25519_SPKI_PREFIX.length);
+    const deviceId = crypto.createHash('sha256').update(rawPublicKey).digest('hex');
+    const publicKeyBase64Url = rawPublicKey.toString('base64url');
+    return { deviceId, publicKeyBase64Url };
+}
+
+// Load existing paired devices
+let paired = {};
+try {
+    if (fs.existsSync(pairedPath)) {
+        paired = JSON.parse(fs.readFileSync(pairedPath, 'utf8'));
+    }
+} catch (e) {}
+
+const now = Date.now();
+for (let i = 0; i < maxInstances; i++) {
+    const instanceSeed = seed + ':' + i;
+    const { deviceId, publicKeyBase64Url } = deriveDeviceFromSeed(instanceSeed);
+    const displayName = baseName + '-' + i;
+
+    paired[deviceId] = {
+        deviceId,
+        publicKey: publicKeyBase64Url,
+        displayName,
+        platform: 'linux',
+        clientId: 'node-host',
+        clientMode: 'node',
+        role: 'node',
+        roles: ['node'],
+        scopes: [],
+        createdAtMs: now,
+        approvedAtMs: now
+    };
+
+    console.log('  Instance ' + i + ': deviceId=' + deviceId.substring(0, 16) + '... name=' + displayName);
+}
+
+fs.mkdirSync(devicesDir, { recursive: true });
+fs.writeFileSync(pairedPath, JSON.stringify(paired, null, 2));
+console.log('  Pre-paired ' + maxInstances + ' device(s) at: ' + pairedPath);
+" 2>&1
+
+    if [ $? -ne 0 ]; then
+        echo "  Seed-based pre-registration script failed with exit code $?"
+    fi
+
+elif [ -n "$OPENCLAW_NODE_DEVICE_PUBLIC_KEY" ]; then
+    # Legacy: Explicit PEM public key approach
+    echo ""
+    echo "=== Pre-registering Node Device (legacy PEM) ==="
     echo "  Public key env var length: ${#OPENCLAW_NODE_DEVICE_PUBLIC_KEY}"
-    echo "  State dir: ${OPENCLAW_STATE_DIR:-\$HOME/.openclaw}"
-    NODE_DEVICE_ID="${OPENCLAW_NODE_DEVICE_ID:-cf-node-device}"
+    echo "  State dir: ${OPENCLAW_STATE_DIR:-$HOME/.openclaw}"
 
     node -e "
 const fs = require('fs');
@@ -296,19 +429,14 @@ const displayName = process.env.OPENCLAW_NODE_DEVICE_NAME || 'cf-node';
 console.log('  Display Name: ' + displayName);
 console.log('  Public key first line: ' + (publicKeyPem || '').split('\\n')[0]);
 
-// Calculate deviceId from public key (SHA256 of raw key bytes)
 const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
 try {
     const key = crypto.createPublicKey(publicKeyPem);
     const spki = key.export({ type: 'spki', format: 'der' });
     const rawKey = spki.subarray(ED25519_SPKI_PREFIX.length);
     const deviceId = crypto.createHash('sha256').update(rawKey).digest('hex');
-    // Convert raw key to base64url format (what OpenClaw expects for pairing check)
     const publicKeyBase64Url = rawKey.toString('base64url');
 
-    // Load existing paired devices
-    // Format: just a flat map { deviceId: PairedDevice, ... }
-    // (pending.json and paired.json are separate files, each stores a simple map)
     let paired = {};
     try {
         if (fs.existsSync(pairedPath)) {
@@ -316,7 +444,6 @@ try {
         }
     } catch (e) {}
 
-    // Add the node device as pre-paired
     const now = Date.now();
     paired[deviceId] = {
         deviceId,
@@ -336,7 +463,6 @@ try {
     fs.writeFileSync(pairedPath, JSON.stringify(paired, null, 2));
     console.log('  Device ID: ' + deviceId);
     console.log('  Public Key (base64url): ' + publicKeyBase64Url);
-    console.log('  Display Name: ' + displayName);
     console.log('  Pre-paired device registered at: ' + pairedPath);
 } catch (err) {
     console.log('  ERROR: Failed to pre-register node device: ' + err.message);
@@ -345,6 +471,6 @@ try {
 " 2>&1
 
     if [ $? -ne 0 ]; then
-        echo "  Node.js pre-registration script failed with exit code $?"
+        echo "  PEM-based pre-registration script failed with exit code $?"
     fi
 fi

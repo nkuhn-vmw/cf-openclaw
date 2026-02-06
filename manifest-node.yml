@@ -26,15 +26,17 @@ applications:
       OPENCLAW_GATEWAY_HOST: openclaw.apps.internal
       OPENCLAW_GATEWAY_PORT: "8081"
       # OPENCLAW_GATEWAY_TOKEN: (set via cf set-env - required!)
-      # Node display name (shown in gateway UI)
+      # Node display name (instance index auto-appended in seed mode)
       OPENCLAW_NODE_NAME: "cf-node"
-      # Pre-registered device identity for auto-pairing
-      # These must match what's configured in the gateway (via OPENCLAW_NODE_DEVICE_PUBLIC_KEY)
-      # Set via cf set-env (do not commit keys to git):
-      #   cf set-env openclaw-node OPENCLAW_NODE_DEVICE_PUBLIC_KEY "-----BEGIN PUBLIC KEY-----..."
-      #   cf set-env openclaw-node OPENCLAW_NODE_DEVICE_PRIVATE_KEY "-----BEGIN PRIVATE KEY-----..."
-      # OPENCLAW_NODE_DEVICE_PUBLIC_KEY: (set via cf set-env - required)
-      # OPENCLAW_NODE_DEVICE_PRIVATE_KEY: (set via cf set-env - required)
+      # --- Device Identity for Auto-Pairing ---
+      # Option 1 (recommended): Shared seed - must match gateway's OPENCLAW_NODE_SEED
+      # Supports multi-instance: cf scale openclaw-node -i N
+      # Each instance derives a unique keypair from seed + CF_INSTANCE_INDEX
+      # OPENCLAW_NODE_SEED: (set via cf set-env - same value as gateway)
+      #
+      # Option 2 (legacy): Explicit PEM keypair
+      # OPENCLAW_NODE_DEVICE_PUBLIC_KEY: (set via cf set-env)
+      # OPENCLAW_NODE_DEVICE_PRIVATE_KEY: (set via cf set-env)
 
     routes:
       # No external routes needed - node only connects outbound to gateway

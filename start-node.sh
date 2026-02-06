@@ -25,13 +25,69 @@ if [ -z "$GATEWAY_TOKEN" ]; then
 fi
 
 # ============================================================
-# Set up pre-registered device identity
+# Set up device identity
 # ============================================================
-# If OPENCLAW_NODE_DEVICE_PRIVATE_KEY is set, write the device identity
-# so the node connects with the same identity pre-registered in the gateway.
-if [ -n "$OPENCLAW_NODE_DEVICE_PUBLIC_KEY" ] && [ -n "$OPENCLAW_NODE_DEVICE_PRIVATE_KEY" ]; then
+# Priority: 1. OPENCLAW_NODE_SEED (deterministic), 2. PEM keys (legacy)
+
+if [ -n "$OPENCLAW_NODE_SEED" ]; then
     echo ""
-    echo "Setting up pre-registered device identity..."
+    echo "Setting up device identity from seed..."
+
+    # Use CF_INSTANCE_INDEX for multi-instance support (default 0)
+    INSTANCE_INDEX="${CF_INSTANCE_INDEX:-0}"
+    NODE_NAME="${OPENCLAW_NODE_NAME:-cf-node}-${INSTANCE_INDEX}"
+    echo "  Instance index: ${INSTANCE_INDEX}"
+    echo "  Node name: ${NODE_NAME}"
+
+    IDENTITY_DIR="${HOME}/.openclaw/identity"
+    mkdir -p "$IDENTITY_DIR"
+
+    node -e "
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
+const seed = process.env.OPENCLAW_NODE_SEED;
+const instanceIndex = process.env.CF_INSTANCE_INDEX || '0';
+const instanceSeed = seed + ':' + instanceIndex;
+
+// Ed25519 DER format prefixes
+const ED25519_PKCS8_PREFIX = Buffer.from('302e020100300506032b657004220420', 'hex');
+const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
+
+// Derive keypair from seed
+const seedBytes = crypto.createHash('sha256').update(instanceSeed).digest();
+const pkcs8Der = Buffer.concat([ED25519_PKCS8_PREFIX, seedBytes]);
+const privateKey = crypto.createPrivateKey({ key: pkcs8Der, format: 'der', type: 'pkcs8' });
+const publicKey = crypto.createPublicKey(privateKey);
+
+const publicKeyPem = publicKey.export({ type: 'spki', format: 'pem' });
+const privateKeyPem = privateKey.export({ type: 'pkcs8', format: 'pem' });
+
+const spki = publicKey.export({ type: 'spki', format: 'der' });
+const rawKey = spki.subarray(ED25519_SPKI_PREFIX.length);
+const deviceId = crypto.createHash('sha256').update(rawKey).digest('hex');
+
+const identity = {
+    version: 1,
+    deviceId,
+    publicKeyPem,
+    privateKeyPem,
+    createdAtMs: Date.now()
+};
+
+const identityPath = path.join(process.env.HOME, '.openclaw', 'identity', 'device.json');
+fs.mkdirSync(path.dirname(identityPath), { recursive: true });
+fs.writeFileSync(identityPath, JSON.stringify(identity, null, 2));
+fs.chmodSync(identityPath, 0o600);
+console.log('  Device ID: ' + deviceId);
+console.log('  Identity written to: ' + identityPath);
+" 2>&1
+
+elif [ -n "$OPENCLAW_NODE_DEVICE_PUBLIC_KEY" ] && [ -n "$OPENCLAW_NODE_DEVICE_PRIVATE_KEY" ]; then
+    # Legacy: Explicit PEM keypair approach
+    echo ""
+    echo "Setting up pre-registered device identity (legacy PEM)..."
 
     IDENTITY_DIR="${HOME}/.openclaw/identity"
     mkdir -p "$IDENTITY_DIR"
@@ -44,7 +100,6 @@ const crypto = require('crypto');
 const publicKeyPem = process.env.OPENCLAW_NODE_DEVICE_PUBLIC_KEY;
 const privateKeyPem = process.env.OPENCLAW_NODE_DEVICE_PRIVATE_KEY;
 
-// Calculate deviceId from public key
 const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
 try {
     const key = crypto.createPublicKey(publicKeyPem);
