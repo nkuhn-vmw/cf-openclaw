@@ -178,7 +178,14 @@ const config = {
         auth: {
             mode: 'token',
             token: gatewayToken
-        }
+        },
+        // Allow Control UI (browser) to connect with token-only auth,
+        // without requiring device pairing. Safe when SSO protects access.
+        controlUi: {
+            allowInsecureAuth: true
+        },
+        // Trust the local proxy chain (oauth2-proxy → token-inject → OpenClaw)
+        trustedProxies: ['127.0.0.1']
     }
 };
 
