@@ -1,0 +1,46 @@
+# Cloud Foundry manifest for OpenClaw Node
+# A node provides system.run/system.which capabilities to the gateway
+#
+# Deploy with: cf push -f manifest-node.yml
+#
+# Prerequisites:
+#   1. Gateway must be running (cf push -f manifest-buildpack.yml)
+#   2. Add network policy: cf add-network-policy openclaw-node openclaw --port 8081 --protocol tcp
+#   3. Set the gateway token: cf set-env openclaw-node OPENCLAW_GATEWAY_TOKEN <token>
+#      (Get the token from: cf logs openclaw --recent | grep "Token:")
+---
+applications:
+  - name: openclaw-node
+    memory: 1G
+    disk_quota: 4G
+    instances: 1
+
+    buildpacks:
+      - nodejs_buildpack
+
+    command: bash start-node.sh
+
+    env:
+      NODE_ENV: production
+      # Gateway connection - uses internal CF networking
+      OPENCLAW_GATEWAY_HOST: openclaw.apps.internal
+      OPENCLAW_GATEWAY_PORT: "8081"
+      # OPENCLAW_GATEWAY_TOKEN: (set via cf set-env - required!)
+      # Node display name (shown in gateway UI)
+      OPENCLAW_NODE_NAME: "cf-node"
+      # Pre-registered device identity for auto-pairing
+      # These must match what's configured in the gateway (via OPENCLAW_NODE_DEVICE_PUBLIC_KEY)
+      # Set via cf set-env (do not commit keys to git):
+      #   cf set-env openclaw-node OPENCLAW_NODE_DEVICE_PUBLIC_KEY "-----BEGIN PUBLIC KEY-----..."
+      #   cf set-env openclaw-node OPENCLAW_NODE_DEVICE_PRIVATE_KEY "-----BEGIN PRIVATE KEY-----..."
+      # OPENCLAW_NODE_DEVICE_PUBLIC_KEY: (set via cf set-env - required)
+      # OPENCLAW_NODE_DEVICE_PRIVATE_KEY: (set via cf set-env - required)
+
+    routes:
+      # No external routes needed - node only connects outbound to gateway
+      - route: openclaw-node.apps.internal
+
+    health-check-type: process
+    timeout: 120
+
+    # No services needed - node connects to gateway only

@@ -268,3 +268,83 @@ if [ -z "$OPENCLAW_GATEWAY_TOKEN" ]; then
         " 2>/dev/null)
     fi
 fi
+
+# ============================================================
+# Pre-register CF Node Device for auto-pairing
+# ============================================================
+# When OPENCLAW_NODE_DEVICE_PUBLIC_KEY is set, pre-register the node's
+# device identity as paired so it can connect without manual approval.
+if [ -n "$OPENCLAW_NODE_DEVICE_PUBLIC_KEY" ]; then
+    echo ""
+    echo "=== Pre-registering Node Device ==="
+    echo "  Public key env var length: ${#OPENCLAW_NODE_DEVICE_PUBLIC_KEY}"
+    echo "  State dir: ${OPENCLAW_STATE_DIR:-\$HOME/.openclaw}"
+    NODE_DEVICE_ID="${OPENCLAW_NODE_DEVICE_ID:-cf-node-device}"
+
+    node -e "
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
+const stateDir = process.env.OPENCLAW_STATE_DIR || path.join(process.env.HOME, '.openclaw');
+const devicesDir = path.join(stateDir, 'devices');
+const pairedPath = path.join(devicesDir, 'paired.json');
+
+const publicKeyPem = process.env.OPENCLAW_NODE_DEVICE_PUBLIC_KEY;
+const displayName = process.env.OPENCLAW_NODE_DEVICE_NAME || 'cf-node';
+
+console.log('  Display Name: ' + displayName);
+console.log('  Public key first line: ' + (publicKeyPem || '').split('\\n')[0]);
+
+// Calculate deviceId from public key (SHA256 of raw key bytes)
+const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
+try {
+    const key = crypto.createPublicKey(publicKeyPem);
+    const spki = key.export({ type: 'spki', format: 'der' });
+    const rawKey = spki.subarray(ED25519_SPKI_PREFIX.length);
+    const deviceId = crypto.createHash('sha256').update(rawKey).digest('hex');
+    // Convert raw key to base64url format (what OpenClaw expects for pairing check)
+    const publicKeyBase64Url = rawKey.toString('base64url');
+
+    // Load existing paired devices
+    // Format: just a flat map { deviceId: PairedDevice, ... }
+    // (pending.json and paired.json are separate files, each stores a simple map)
+    let paired = {};
+    try {
+        if (fs.existsSync(pairedPath)) {
+            paired = JSON.parse(fs.readFileSync(pairedPath, 'utf8'));
+        }
+    } catch (e) {}
+
+    // Add the node device as pre-paired
+    const now = Date.now();
+    paired[deviceId] = {
+        deviceId,
+        publicKey: publicKeyBase64Url,
+        displayName,
+        platform: 'linux',
+        clientId: 'node-host',
+        clientMode: 'node',
+        role: 'node',
+        roles: ['node'],
+        scopes: [],
+        createdAtMs: now,
+        approvedAtMs: now
+    };
+
+    fs.mkdirSync(devicesDir, { recursive: true });
+    fs.writeFileSync(pairedPath, JSON.stringify(paired, null, 2));
+    console.log('  Device ID: ' + deviceId);
+    console.log('  Public Key (base64url): ' + publicKeyBase64Url);
+    console.log('  Display Name: ' + displayName);
+    console.log('  Pre-paired device registered at: ' + pairedPath);
+} catch (err) {
+    console.log('  ERROR: Failed to pre-register node device: ' + err.message);
+    console.log('  Stack: ' + err.stack);
+}
+" 2>&1
+
+    if [ $? -ne 0 ]; then
+        echo "  Node.js pre-registration script failed with exit code $?"
+    fi
+fi

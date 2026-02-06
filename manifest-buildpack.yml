@@ -43,6 +43,16 @@ applications:
       # ANTHROPIC_API_KEY: (set via cf set-env)
       # OPENAI_API_KEY: (set via cf set-env)
 
+      # --- Node Auto-Pairing ---
+      # Pre-register the CF node's device identity so it can connect without manual approval.
+      # Generate a keypair and set via cf set-env (do not commit keys to git):
+      #   node -e "const c=require('crypto');const k=c.generateKeyPairSync('ed25519');console.log(k.publicKey.export({type:'spki',format:'pem'}));console.log(k.privateKey.export({type:'pkcs8',format:'pem'}))"
+      #   cf set-env openclaw OPENCLAW_NODE_DEVICE_PUBLIC_KEY "-----BEGIN PUBLIC KEY-----..."
+      #   cf set-env openclaw-node OPENCLAW_NODE_DEVICE_PUBLIC_KEY "-----BEGIN PUBLIC KEY-----..."
+      #   cf set-env openclaw-node OPENCLAW_NODE_DEVICE_PRIVATE_KEY "-----BEGIN PRIVATE KEY-----..."
+      # OPENCLAW_NODE_DEVICE_PUBLIC_KEY: (set via cf set-env)
+      OPENCLAW_NODE_DEVICE_NAME: "cf-node"
+
     routes:
       - route: openclaw.apps.tas-tdc.kuhn-labs.com
 

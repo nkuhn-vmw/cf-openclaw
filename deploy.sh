@@ -258,6 +258,78 @@ full_setup() {
     show_info
 }
 
+# Deploy node (system.run capability)
+deploy_node() {
+    local NODE_NAME="openclaw-node"
+
+    echo -e "\n${CYAN}=== Deploy OpenClaw Node ===${NC}"
+    echo "A node provides system.run/system.which capabilities to the gateway."
+    echo ""
+
+    # Check if gateway is running
+    if ! cf app "$APP_NAME" &>/dev/null; then
+        echo -e "${RED}Error: Gateway app '$APP_NAME' not found.${NC}"
+        echo "Deploy the gateway first using option 1 or 2."
+        return 1
+    fi
+
+    # Get gateway token
+    echo -e "${YELLOW}Retrieving gateway token...${NC}"
+    local gateway_token
+    gateway_token=$(cf env "$APP_NAME" 2>/dev/null | grep "OPENCLAW_GATEWAY_TOKEN" | awk -F: '{print $2}' | tr -d ' ')
+
+    if [ -z "$gateway_token" ]; then
+        echo "Gateway token not found in env. Checking recent logs..."
+        gateway_token=$(cf logs "$APP_NAME" --recent 2>/dev/null | grep -o "Token: [a-f0-9]*" | tail -1 | awk '{print $2}')
+    fi
+
+    if [ -z "$gateway_token" ]; then
+        echo -e "${YELLOW}Could not auto-detect gateway token.${NC}"
+        read -p "Enter the gateway token: " gateway_token
+        if [ -z "$gateway_token" ]; then
+            echo -e "${RED}Gateway token is required.${NC}"
+            return 1
+        fi
+    else
+        echo -e "${GREEN}Found gateway token: ${gateway_token:0:8}...${NC}"
+    fi
+
+    # Check if we're in the openclaw source directory
+    if [ ! -f "package.json" ]; then
+        echo -e "${RED}Error: Must run from OpenClaw source directory${NC}"
+        echo "cd into the openclaw-src directory and try again."
+        return 1
+    fi
+
+    # Copy node deployment files if not present
+    if [ ! -f "manifest-node.yml" ]; then
+        echo -e "${YELLOW}Copying node deployment files...${NC}"
+        [ -f "../cf-openclaw/manifest-node.yml" ] && cp ../cf-openclaw/manifest-node.yml .
+        [ -f "../cf-openclaw/start-node.sh" ] && cp ../cf-openclaw/start-node.sh .
+    fi
+
+    # Set the gateway token
+    echo -e "${CYAN}Deploying node...${NC}"
+    cf push -f manifest-node.yml --no-start
+    cf set-env "$NODE_NAME" OPENCLAW_GATEWAY_TOKEN "$gateway_token"
+
+    # Add network policy
+    echo -e "${YELLOW}Adding network policy for container-to-container communication...${NC}"
+    cf add-network-policy "$NODE_NAME" "$APP_NAME" --port 8081 --protocol tcp || {
+        echo -e "${YELLOW}Note: Network policy may already exist or require admin privileges.${NC}"
+    }
+
+    # Start the node
+    cf start "$NODE_NAME"
+
+    echo -e "\n${GREEN}Node deployed!${NC}"
+    echo ""
+    echo "The node will connect to the gateway via internal CF networking."
+    echo "Check status with: cf logs $NODE_NAME --recent"
+    echo ""
+    echo "Once connected, the node provides system.run capabilities to agents."
+}
+
 # Main menu
 main() {
     check_prerequisites
@@ -270,8 +342,9 @@ main() {
     echo "5) Enable SSO"
     echo "6) Set gateway token"
     echo "7) Set manual API keys (alternative to GenAI)"
-    echo "8) Show app info"
-    read -p "Enter choice [1-8]: " choice
+    echo "8) Deploy node (system.run capability)"
+    echo "9) Show app info"
+    read -p "Enter choice [1-9]: " choice
 
     case $choice in
         1) full_setup ;;
@@ -281,7 +354,8 @@ main() {
         5) setup_sso ;;
         6) setup_gateway_token ;;
         7) set_api_keys ;;
-        8) show_info ;;
+        8) deploy_node ;;
+        9) show_info ;;
         *)
             echo -e "${RED}Invalid choice${NC}"
             exit 1
