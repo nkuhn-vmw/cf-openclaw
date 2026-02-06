@@ -129,7 +129,7 @@ if (genaiBinding) {
                 provider: {
                     baseUrl: baseUrl,
                     apiKey: apiKey,
-                    api: 'openai-responses',
+                    api: 'openai-completions',
                     models: [
                         {
                             id: sanitizedModel,
