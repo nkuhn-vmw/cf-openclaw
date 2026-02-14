@@ -20,7 +20,6 @@ applications:
     docker:
       image: openclaw/openclaw:latest  # TODO: Change to your actual image
 
-    # start.sh handles SSO proxy (if enabled) or direct startup
     command: bash start.sh
 
     env:
@@ -29,8 +28,6 @@ applications:
       OPENCLAW_STATE_DIR: /home/vcap/app/data
       OPENCLAW_PREFER_PNPM: "1"
       # OPENCLAW_GATEWAY_TOKEN: (set via cf set-env)
-      # OPENCLAW_SSO_ENABLED: "true"
-      # OPENCLAW_COOKIE_SECRET: (set via cf set-env)
 
     routes:
       - route: openclaw.apps.tas-tdc.kuhn-labs.com
@@ -40,4 +37,3 @@ applications:
 
     services:
       - openclaw-genai
-      # - openclaw-sso

@@ -1,10 +1,9 @@
 #!/bin/bash
 # Cloud Foundry .profile script - runs before app starts
-# Configures OpenClaw with GenAI service credentials, gateway auth, and SSO
+# Configures OpenClaw with GenAI service credentials and gateway auth
 
 OPENCLAW_CONFIG_DIR="${HOME}/.openclaw"
 OPENCLAW_CONFIG_FILE="${OPENCLAW_CONFIG_DIR}/openclaw.json"
-SSO_ENV_FILE="${HOME}/sso.env"
 
 mkdir -p "$OPENCLAW_CONFIG_DIR"
 
@@ -22,7 +21,6 @@ if (binding) {
     const map = {
         gateway_token: 'OPENCLAW_GATEWAY_TOKEN',
         node_seed: 'OPENCLAW_NODE_SEED',
-        cookie_secret: 'OPENCLAW_COOKIE_SECRET',
         node_max_instances: 'OPENCLAW_NODE_MAX_INSTANCES',
         pinned_version: 'OPENCLAW_PINNED_VERSION'
     };
@@ -89,10 +87,29 @@ if (genaiBinding) {
                 const modelsData = JSON.parse(modelsResponse);
 
                 if (modelsData.data && modelsData.data.length > 0) {
-                    // Pick the first available model
-                    modelName = modelsData.data[0].id;
-                    console.log('  Discovered ' + modelsData.data.length + ' model(s):');
-                    modelsData.data.forEach(m => console.log('    - ' + m.id));
+                    // Filter out embedding models (not usable for chat)
+                    allModels = modelsData.data.filter(m => !(/embed/i.test(m.id)));
+                    console.log('  Discovered ' + modelsData.data.length + ' model(s) (' + allModels.length + ' chat-capable):');
+                    modelsData.data.forEach(m => {
+                        const skip = /embed/i.test(m.id) ? ' (embedding, skipped)' : '';
+                        console.log('    - ' + m.id + skip);
+                    });
+                    // Prefer model set via OPENCLAW_PREFERRED_MODEL env var, or pick
+                    // the largest model (prefer names containing size hints like '120b')
+                    const preferred = process.env.OPENCLAW_PREFERRED_MODEL;
+                    if (preferred) {
+                        const match = allModels.find(m => m.id === preferred || m.id.includes(preferred));
+                        if (match) modelName = match.id;
+                        else console.log('  WARNING: Preferred model "' + preferred + '" not found');
+                    }
+                    if (!modelName && allModels.length > 0) {
+                        // Heuristic: prefer models with larger parameter counts
+                        const sorted = [...allModels].sort((a, b) => {
+                            const sizeOf = id => { const m = id.match(/(\\d+)[bB]/); return m ? parseInt(m[1]) : 0; };
+                            return sizeOf(b.id) - sizeOf(a.id);
+                        });
+                        modelName = sorted[0].id;
+                    }
                 } else {
                     console.log('  WARNING: No models found via discovery endpoint');
                 }
@@ -126,6 +143,26 @@ if (genaiBinding) {
                 baseUrl = baseUrl + '/openai/v1';
             }
 
+            // Build model entries for all discovered chat models
+            const modelCompat = {
+                maxTokensField: 'max_tokens',
+                supportsDeveloperRole: false,
+                supportsStore: false
+            };
+            const modelEntries = (allModels || [{ id: modelName }]).map(m => ({
+                id: m.id.replace(/\\//g, '-'),
+                name: m.id,
+                reasoning: false,
+                input: ['text'],
+                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                contextWindow: 32768,
+                maxTokens: 8192,
+                compat: modelCompat
+            }));
+            // Ensure primary model is first in the list
+            modelEntries.sort((a, b) => (a.id === apiModelId ? -1 : b.id === apiModelId ? 1 : 0));
+            console.log('  Registered ' + modelEntries.length + ' model(s) with OpenClaw');
+
             genaiConfig = {
                 providerName,
                 modelId,
@@ -133,23 +170,7 @@ if (genaiBinding) {
                     baseUrl: baseUrl,
                     apiKey: apiKey,
                     api: 'openai-completions',
-                    models: [
-                        {
-                            id: apiModelId,
-                            name: modelName,
-                            reasoning: false,
-                            input: ['text'],
-                            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-                            contextWindow: 32768,
-                            maxTokens: 8192,
-                            // Tanzu GenAI proxy (vLLM-based) doesn't support newer OpenAI params
-                            compat: {
-                                maxTokensField: 'max_tokens',
-                                supportsDeveloperRole: false,
-                                supportsStore: false
-                            }
-                        }
-                    ]
+                    models: modelEntries
                 }
             };
         } else {
@@ -161,11 +182,6 @@ if (genaiBinding) {
 }
 
 // --- Gateway Authentication ---
-// Gateway token auth is always configured. When SSO is enabled, the token
-// redirect proxy (in start.sh) auto-injects the token into the initial URL
-// so the browser stores it for WebSocket auth.
-const ssoEnabled = process.env.OPENCLAW_SSO_ENABLED === 'true';
-
 let gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN;
 if (!gatewayToken) {
     const crypto = require('crypto');
@@ -174,12 +190,8 @@ if (!gatewayToken) {
     console.log('=== Gateway Authentication ===');
     console.log('Auto-generated gateway token (no OPENCLAW_GATEWAY_TOKEN env var set):');
     console.log('  Token: ' + gatewayToken);
-    if (ssoEnabled) {
-        console.log('  Token will be auto-injected via SSO redirect proxy.');
-    } else {
-        console.log('  Set this in your client to connect to the gateway.');
-        console.log('  To use a fixed token: cf set-env openclaw OPENCLAW_GATEWAY_TOKEN <your-token>');
-    }
+    console.log('  Set this in your client to connect to the gateway.');
+    console.log('  To use a fixed token: cf set-env openclaw OPENCLAW_GATEWAY_TOKEN <your-token>');
 }
 
 const config = {
@@ -188,13 +200,9 @@ const config = {
             mode: 'token',
             token: gatewayToken
         },
-        // Allow Control UI (browser) to connect with token-only auth,
-        // without requiring device pairing. Safe when SSO protects access.
         controlUi: {
             allowInsecureAuth: true
-        },
-        // Trust the local proxy chain (oauth2-proxy → token-inject → OpenClaw)
-        trustedProxies: ['127.0.0.1']
+        }
     }
 };
 
@@ -212,32 +220,6 @@ if (genaiConfig) {
             [genaiConfig.providerName]: genaiConfig.provider
         }
     };
-}
-
-// --- SSO (p-identity) Credentials ---
-const ssoBinding = vcap['p-identity']?.[0]?.credentials;
-if (ssoBinding) {
-    console.log('');
-    console.log('=== SSO Service (p-identity) ===');
-    console.log('  Auth Domain: ' + ssoBinding.auth_domain);
-    console.log('  Client ID: ' + ssoBinding.client_id);
-    console.log('  Issuer URI: ' + (ssoBinding.issuer_uri || 'not provided'));
-
-    // Write SSO credentials to env file for start.sh to consume
-    // Include the gateway token so start.sh can inject it into the proxy
-    const ssoEnv = [
-        'SSO_AUTH_DOMAIN=' + ssoBinding.auth_domain,
-        'SSO_CLIENT_ID=' + ssoBinding.client_id,
-        'SSO_CLIENT_SECRET=' + ssoBinding.client_secret,
-        'SSO_ISSUER_URI=' + (ssoBinding.issuer_uri || ssoBinding.auth_domain + '/oauth/token'),
-        'SSO_GATEWAY_TOKEN=' + gatewayToken,
-        ''
-    ].join('\\n');
-    fs.writeFileSync(process.env.HOME + '/sso.env', ssoEnv);
-    console.log('  SSO credentials written to ~/sso.env');
-} else {
-    console.log('');
-    console.log('No SSO service (p-identity) found in VCAP_SERVICES');
 }
 
 // --- Merge and Write Config ---
@@ -291,7 +273,7 @@ console.log('OpenClaw config written to: ' + configPath);
 if (genaiConfig) {
     console.log('Primary model: ' + genaiConfig.modelId);
 }
-console.log('Gateway auth: token mode' + (ssoEnabled ? ' (auto-injected via SSO proxy)' : ''));
+console.log('Gateway auth: token mode');
 " 2>&1
 
     if [ $? -eq 0 ]; then
@@ -329,31 +311,56 @@ fi
 export OPENCLAW_VERSION
 
 # ============================================================
-# NFS Volume Detection (Persistent Storage)
+# S3 Storage Detection (Persistent Storage)
 # ============================================================
-# If an NFS volume service is bound, auto-detect the mount path and use it
-# for OPENCLAW_STATE_DIR so state persists across restages/restarts.
-# Binding the service is the opt-in — no extra env var needed.
+# Search VCAP_SERVICES for S3-compatible credentials across service types:
+# seaweedfs, s3, aws-s3, minio, ceph, or user-provided.
+# Writes ~/s3.env for start.sh to source before launching OpenClaw.
 if [ -n "$VCAP_SERVICES" ]; then
-    NFS_MOUNT=$(node -e "
+    S3_DETECTED=$(node -e "
 const vcap = JSON.parse(process.env.VCAP_SERVICES || '{}');
-const nfsBindings = vcap['nfs'] || vcap['smb'] || [];
-const mount = nfsBindings[0]?.volume_mounts?.[0]?.container_dir;
-if (mount) process.stdout.write(mount);
+const serviceTypes = ['seaweedfs', 's3', 'aws-s3', 'minio', 'ceph', 'user-provided'];
+let creds = null;
+let svcName = '';
+for (const type of serviceTypes) {
+    for (const svc of (vcap[type] || [])) {
+        const c = svc.credentials || {};
+        // Support both naming conventions: access_key_id/secret_access_key (AWS)
+        // and access_key/secret_key (SeaweedFS, MinIO)
+        const accessKey = c.access_key_id || c.access_key;
+        const secretKey = c.secret_access_key || c.secret_key;
+        if (accessKey && secretKey && c.bucket) {
+            creds = { ...c, _accessKey: accessKey, _secretKey: secretKey };
+            svcName = svc.name;
+            break;
+        }
+    }
+    if (creds) break;
+}
+if (creds) {
+    const lines = [
+        'export S3_ACCESS_KEY_ID=\"' + creds._accessKey + '\"',
+        'export S3_SECRET_ACCESS_KEY=\"' + creds._secretKey + '\"',
+        'export S3_BUCKET=\"' + creds.bucket + '\"',
+    ];
+    const endpoint = creds.endpoint_url || creds.endpoint;
+    if (endpoint) {
+        // Ensure endpoint has a protocol prefix
+        const ep = endpoint.match(/^https?:\/\//) ? endpoint : 'https://' + endpoint;
+        lines.push('export S3_ENDPOINT=\"' + ep + '\"');
+    }
+    if (creds.region) lines.push('export S3_REGION=\"' + creds.region + '\"');
+    require('fs').writeFileSync(process.env.HOME + '/s3.env', lines.join('\n') + '\n');
+    console.log('found:' + svcName);
+}
 " 2>/dev/null)
 
-    if [ -n "$NFS_MOUNT" ]; then
+    if [ -n "$S3_DETECTED" ]; then
         echo ""
-        echo "=== NFS Persistent Storage ==="
-        echo "  Volume mount detected: ${NFS_MOUNT}"
-        # Only override if OPENCLAW_STATE_DIR wasn't explicitly set by the user
-        if [ "${OPENCLAW_STATE_DIR}" = "/home/vcap/app/data" ] || [ -z "${OPENCLAW_STATE_DIR_SET_BY_USER}" ]; then
-            export OPENCLAW_STATE_DIR="${NFS_MOUNT}/openclaw"
-            mkdir -p "$OPENCLAW_STATE_DIR"
-            echo "  OPENCLAW_STATE_DIR set to: ${OPENCLAW_STATE_DIR}"
-        else
-            echo "  OPENCLAW_STATE_DIR already set to: ${OPENCLAW_STATE_DIR} (not overriding)"
-        fi
+        echo "=== S3 Persistent Storage ==="
+        echo "  Service: ${S3_DETECTED#found:}"
+        echo "  Credentials written to ~/s3.env"
+        echo "  State will be synced to/from S3 by start.sh"
     fi
 fi
 

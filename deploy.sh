@@ -1,6 +1,6 @@
 #!/bin/bash
 # OpenClaw Cloud Foundry Deployment Script
-# Supports: GenAI service binding, SSO integration, gateway auth
+# Supports: GenAI service binding, gateway auth, S3 persistent storage
 set -e
 
 # Colors for output
@@ -126,51 +126,6 @@ setup_genai() {
     echo "The .profile script will automatically configure OpenClaw to use this model."
 }
 
-# Setup SSO with p-identity
-setup_sso() {
-    echo -e "\n${CYAN}=== SSO Setup (p-identity) ===${NC}"
-
-    # Check if p-identity service is available
-    if ! cf marketplace 2>/dev/null | grep -q "p-identity"; then
-        echo -e "${RED}Error: SSO service (p-identity) not found in marketplace${NC}"
-        echo "Contact your platform operator to install the SSO tile."
-        return 1
-    fi
-
-    echo -e "${YELLOW}Available SSO plans:${NC}"
-    cf marketplace -e p-identity 2>/dev/null || echo "(Could not list plans)"
-    echo ""
-
-    # Check if service already exists
-    if cf service openclaw-sso &>/dev/null; then
-        echo -e "${GREEN}Service 'openclaw-sso' already exists.${NC}"
-    else
-        read -p "Enter SSO plan name: " sso_plan
-        if [ -z "$sso_plan" ]; then
-            echo "No plan specified, skipping SSO setup."
-            return 0
-        fi
-
-        echo -e "${YELLOW}Creating SSO service...${NC}"
-        cf create-service p-identity "$sso_plan" openclaw-sso
-    fi
-
-    echo -e "${YELLOW}Binding SSO service to ${APP_NAME}...${NC}"
-    cf bind-service "$APP_NAME" openclaw-sso 2>/dev/null || {
-        echo -e "${YELLOW}App not yet deployed. Add 'openclaw-sso' to services in manifest.${NC}"
-    }
-
-    # Generate cookie secret
-    COOKIE_SECRET=$(openssl rand -base64 32)
-    echo -e "${YELLOW}Setting SSO environment variables...${NC}"
-    cf set-env "$APP_NAME" OPENCLAW_SSO_ENABLED "true"
-    cf set-env "$APP_NAME" OPENCLAW_COOKIE_SECRET "$COOKIE_SECRET"
-
-    echo -e "${GREEN}SSO configured!${NC}"
-    echo "Remember to add 'openclaw-sso' to the services list in your manifest."
-    echo "Then restage: cf restage $APP_NAME"
-}
-
 # Setup gateway token
 setup_gateway_token() {
     echo -e "\n${CYAN}=== Gateway Token Setup ===${NC}"
@@ -217,7 +172,7 @@ setup_secrets() {
     local svc_name="openclaw-secrets"
 
     echo -e "\n${CYAN}=== Secrets Service Setup ===${NC}"
-    echo "Creates a user-provided service with gateway token, node seed, and cookie secret."
+    echo "Creates a user-provided service with gateway token and node seed."
     echo "These are stored in CF's credential store rather than plain env vars."
     echo ""
 
@@ -234,7 +189,7 @@ setup_secrets() {
     fi
 
     # Generate or prompt for secrets
-    local gw_token node_seed cookie_secret
+    local gw_token node_seed
 
     read -p "Enter gateway token (or press Enter to auto-generate): " gw_token
     gw_token="${gw_token:-$(openssl rand -hex 32)}"
@@ -242,10 +197,8 @@ setup_secrets() {
     read -p "Enter node seed (or press Enter to auto-generate): " node_seed
     node_seed="${node_seed:-$(openssl rand -hex 16)}"
 
-    cookie_secret=$(openssl rand -base64 32)
-
     echo -e "${YELLOW}Creating secrets service...${NC}"
-    cf create-user-provided-service "$svc_name" -p "{\"gateway_token\":\"${gw_token}\",\"node_seed\":\"${node_seed}\",\"cookie_secret\":\"${cookie_secret}\"}"
+    cf create-user-provided-service "$svc_name" -p "{\"gateway_token\":\"${gw_token}\",\"node_seed\":\"${node_seed}\"}"
 
     echo -e "${YELLOW}Binding to ${app_name}...${NC}"
     cf bind-service "$app_name" "$svc_name" 2>/dev/null || {
@@ -255,31 +208,18 @@ setup_secrets() {
     echo -e "${GREEN}Secrets service configured!${NC}"
     echo "  Gateway token: ${gw_token:0:8}..."
     echo "  Node seed: ${node_seed:0:8}..."
-    echo "  Cookie secret: (auto-generated)"
     echo ""
     echo "Add 'openclaw-secrets' to the services list in your manifest, then restage."
 }
 
-# Setup NFS persistent storage
-setup_nfs() {
+# Setup S3 persistent storage
+setup_s3() {
     local app_name="${1:-$APP_NAME}"
 
-    echo -e "\n${CYAN}=== NFS Persistent Storage Setup ===${NC}"
-    echo "Bind an NFS volume to persist OpenClaw state (chat history, device pairings,"
-    echo "workspace data) across restages and restarts."
+    echo -e "\n${CYAN}=== S3 Persistent Storage Setup ===${NC}"
+    echo "Bind an S3-compatible object storage service to persist OpenClaw state"
+    echo "(chat history, device pairings, credentials) across restages and restarts."
     echo ""
-    echo -e "${YELLOW}Prerequisites:${NC}"
-    echo "  - NFS volume services must be enabled on your CF foundation"
-    echo "  - An NFS server share must be available"
-    echo ""
-
-    # Check if NFS service type is available
-    if ! cf marketplace 2>/dev/null | grep -qE "^nfs\b"; then
-        echo -e "${RED}Error: NFS volume service not found in marketplace.${NC}"
-        echo "Ask your platform operator to install the NFS Volume Service broker."
-        echo "See: https://docs.cloudfoundry.org/devguide/services/using-vol-services.html"
-        return 1
-    fi
 
     local SVC_NAME="openclaw-storage"
 
@@ -297,30 +237,43 @@ setup_nfs() {
         fi
     fi
 
-    echo -e "${YELLOW}Available NFS plans:${NC}"
-    cf marketplace -e nfs 2>/dev/null || echo "(Could not list plans)"
     echo ""
+    echo "  1) SeaweedFS from marketplace (recommended)"
+    echo "  2) User-provided S3 credentials (AWS S3, MinIO, Ceph, etc.)"
+    echo ""
+    read -p "Select storage option [1-2]: " storage_choice
 
-    read -p "Enter NFS share path (e.g., nfs-server.example.com/exports/openclaw): " nfs_share
-    if [ -z "$nfs_share" ]; then
-        echo "No share path provided, skipping NFS setup."
-        return 0
-    fi
+    case "$storage_choice" in
+        1)
+            echo -e "${YELLOW}Creating SeaweedFS service...${NC}"
+            cf create-service seaweedfs shared "$SVC_NAME"
+            ;;
+        2)
+            echo ""
+            read -p "S3 endpoint URL (e.g., https://s3.amazonaws.com): " s3_endpoint
+            read -p "Access key ID: " s3_access_key
+            read -p "Secret access key: " s3_secret_key
+            read -p "Bucket name: " s3_bucket
+            read -p "Region (default: us-east-1): " s3_region
+            s3_region="${s3_region:-us-east-1}"
 
-    read -p "Enter NFS plan name (default: Existing): " nfs_plan
-    nfs_plan="${nfs_plan:-Existing}"
+            echo -e "${YELLOW}Creating user-provided S3 service...${NC}"
+            cf create-user-provided-service "$SVC_NAME" -p "{\"access_key_id\":\"${s3_access_key}\",\"secret_access_key\":\"${s3_secret_key}\",\"bucket\":\"${s3_bucket}\",\"endpoint\":\"${s3_endpoint}\",\"region\":\"${s3_region}\"}"
+            ;;
+        *)
+            echo "Invalid choice, skipping S3 setup."
+            return 0
+            ;;
+    esac
 
-    echo -e "${YELLOW}Creating NFS service instance...${NC}"
-    cf create-service nfs "$nfs_plan" "$SVC_NAME" -c "{\"share\":\"${nfs_share}\"}"
+    echo -e "${YELLOW}Binding to ${app_name}...${NC}"
+    cf bind-service "$app_name" "$SVC_NAME" 2>/dev/null || {
+        echo -e "${YELLOW}App not yet deployed. Add 'openclaw-storage' to services in manifest.${NC}"
+    }
 
-    echo -e "${YELLOW}Binding to ${app_name} with volume mount...${NC}"
-    cf bind-service "$app_name" "$SVC_NAME" -c '{"uid":"vcap","gid":"vcap","mount":"/home/vcap/app/data/persistent"}'
-
-    echo -e "\n${GREEN}NFS storage configured!${NC}"
+    echo -e "\n${GREEN}S3 storage configured!${NC}"
     echo "  Service: ${SVC_NAME}"
-    echo "  Share: ${nfs_share}"
-    echo "  Mount path: /home/vcap/app/data/persistent"
-    echo "  OPENCLAW_STATE_DIR will auto-detect the mount on next restage."
+    echo "  State will be synced to/from S3 automatically by start.sh."
     echo ""
     echo "Restage to apply: cf restage ${app_name}"
 }
@@ -350,7 +303,6 @@ full_setup() {
     echo "  1. Create and bind a GenAI service"
     echo "  2. Setup gateway authentication"
     echo "  3. Deploy with buildpack"
-    echo "  4. (Optional) Enable SSO"
     echo ""
     read -p "Continue? (y/N): " confirm
     if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
@@ -361,14 +313,6 @@ full_setup() {
     setup_genai
     setup_gateway_token
     deploy_buildpack
-
-    read -p "Enable SSO? (y/N): " enable_sso
-    if [ "$enable_sso" = "y" ] || [ "$enable_sso" = "Y" ]; then
-        setup_sso
-        echo -e "${YELLOW}Restaging to apply SSO...${NC}"
-        cf restage "$APP_NAME"
-    fi
-
     show_info
 }
 
@@ -688,38 +632,36 @@ main() {
     echo "  2) Deploy with buildpack"
     echo "  3) Deploy with Docker"
     echo "  4) Create/bind GenAI service"
-    echo "  5) Enable SSO"
-    echo "  6) Set gateway token"
-    echo "  7) Set manual API keys (alternative to GenAI)"
-    echo "  8) Deploy node (system.run capability)"
-    echo "  9) Scale nodes"
-    echo " 10) Setup secrets service (CredHub)"
-    echo " 11) Setup NFS persistent storage"
-    echo " 12) Show app info"
+    echo "  5) Set gateway token"
+    echo "  6) Set manual API keys (alternative to GenAI)"
+    echo "  7) Deploy node (system.run capability)"
+    echo "  8) Scale nodes"
+    echo "  9) Setup secrets service (CredHub)"
+    echo " 10) Setup S3 persistent storage"
+    echo " 11) Show app info"
     echo ""
     echo -e "${CYAN}Multi-User:${NC}"
-    echo " 13) Create user instance"
-    echo " 14) Destroy user instance"
-    echo " 15) List all instances"
+    echo " 12) Create user instance"
+    echo " 13) Destroy user instance"
+    echo " 14) List all instances"
     echo ""
-    read -p "Enter choice [1-15]: " choice
+    read -p "Enter choice [1-14]: " choice
 
     case $choice in
         1) full_setup ;;
         2) deploy_buildpack ;;
         3) deploy_docker ;;
         4) setup_genai ;;
-        5) setup_sso ;;
-        6) setup_gateway_token ;;
-        7) set_api_keys ;;
-        8) deploy_node ;;
-        9) scale_nodes ;;
-        10) setup_secrets ;;
-        11) setup_nfs ;;
-        12) show_info ;;
-        13) create_instance ;;
-        14) destroy_instance ;;
-        15) list_instances ;;
+        5) setup_gateway_token ;;
+        6) set_api_keys ;;
+        7) deploy_node ;;
+        8) scale_nodes ;;
+        9) setup_secrets ;;
+        10) setup_s3 ;;
+        11) show_info ;;
+        12) create_instance ;;
+        13) destroy_instance ;;
+        14) list_instances ;;
         *)
             echo -e "${RED}Invalid choice${NC}"
             exit 1

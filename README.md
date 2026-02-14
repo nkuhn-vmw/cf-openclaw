@@ -1,12 +1,12 @@
 # OpenClaw Cloud Foundry Deployment
 
-Deploy [OpenClaw](https://github.com/openclaw/openclaw) to Cloud Foundry with automatic Tanzu GenAI service integration and optional SSO authentication.
+Deploy [OpenClaw](https://github.com/openclaw/openclaw) to Cloud Foundry with automatic Tanzu GenAI service integration and S3-backed persistent storage.
 
 ## Features
 
 - **GenAI Service Integration**: Automatically configures OpenClaw to use CF marketplace LLM models (no cloud API keys needed)
-- **SSO Authentication**: Optional oauth2-proxy sidecar using CF's p-identity SSO service
 - **Gateway Auth**: Mandatory token-based authentication for the OpenClaw gateway
+- **S3 Persistent Storage**: Automatic state sync to S3-compatible object storage (SeaweedFS, MinIO, Ceph, AWS S3)
 - **Node Deployment**: Deploy nodes for system.run capabilities with auto-pairing via container-to-container networking
 - **Multi-Instance Scaling**: Scale nodes horizontally with `cf scale` using deterministic seed-based keypair derivation
 - **Secrets Service**: Optional CredHub/user-provided service for centralized secret management
@@ -21,9 +21,10 @@ Deploy [OpenClaw](https://github.com/openclaw/openclaw) to Cloud Foundry with au
 | `manifest-node.yml` | CF manifest for deploying an OpenClaw node |
 | `manifest.yml` | CF manifest for Docker-based deployment (reference) |
 | `.cfignore` | Files to exclude from `cf push` |
-| `.profile` | Startup script that auto-configures GenAI, gateway auth, SSO, and node pairing |
-| `start.sh` | Process wrapper handling SSO proxy or direct startup |
+| `.profile` | Startup script that auto-configures GenAI, gateway auth, S3, and node pairing |
+| `start.sh` | Process wrapper handling S3 sync lifecycle or direct startup |
 | `start-node.sh` | Startup script for node deployment |
+| `s3-sync.cjs` | S3 sync utility for persistent state (restore, backup, flush) |
 | `deploy.sh` | Interactive deployment helper script |
 
 ## Quick Start
@@ -39,6 +40,7 @@ curl -sL https://raw.githubusercontent.com/nkuhn-vmw/cf-openclaw/main/manifest-b
 curl -sL https://raw.githubusercontent.com/nkuhn-vmw/cf-openclaw/main/.cfignore -o .cfignore
 curl -sL https://raw.githubusercontent.com/nkuhn-vmw/cf-openclaw/main/.profile -o .profile
 curl -sL https://raw.githubusercontent.com/nkuhn-vmw/cf-openclaw/main/start.sh -o start.sh
+curl -sL https://raw.githubusercontent.com/nkuhn-vmw/cf-openclaw/main/s3-sync.cjs -o s3-sync.cjs
 chmod +x start.sh
 ```
 
@@ -112,46 +114,63 @@ cf bind-service openclaw openclaw-genai
 cf restage openclaw
 ```
 
-## SSO Authentication (Optional)
+## Persistent Storage with S3 (Optional)
 
-Protect your OpenClaw instance with Cloud Foundry's SSO service using oauth2-proxy as a reverse proxy.
+By default, OpenClaw state (chat history, device pairings, credentials) is stored in the container's ephemeral filesystem and lost on restage or crash. Bind an S3-compatible service to persist this data.
 
-### Architecture
+### How It Works
 
-```
-Without SSO:  Client → CF Router → OpenClaw (:$PORT)
-With SSO:     Client → CF Router → oauth2-proxy (:$PORT) → OpenClaw (:8081)
-                                        ↕
-                                  CF UAA / p-identity
-```
+1. **Restore**: On startup, `s3-sync.cjs restore` downloads persisted files from S3 into the local state directory
+2. **Run**: OpenClaw starts normally with the restored state
+3. **Periodic Backup**: Every 60 seconds, `s3-sync.cjs backup-loop` uploads files that have changed (hash-based change detection)
+4. **Flush on Shutdown**: On SIGTERM/SIGINT, `s3-sync.cjs flush` uploads all remaining changes before exit
+
+### What Is Persisted
+
+- `identity/device.json` — device keypair (critical)
+- `identity/device-auth.json` — device auth tokens
+- `credentials/**/*.json` — OAuth credentials
+- `devices/paired.json` — paired node devices
+- `agents/*/sessions/**` — chat history
+
+Not synced (regenerated at startup): `openclaw.json`, `logs/`, agent XDG config.
 
 ### Setup
 
+**Option 1: SeaweedFS from marketplace (default)**
+
 ```bash
-# 1. Create SSO service
-cf create-service p-identity <plan-name> openclaw-sso
-
-# 2. Bind to app
-cf bind-service openclaw openclaw-sso
-
-# 3. Enable SSO and set cookie secret
-cf set-env openclaw OPENCLAW_SSO_ENABLED true
-cf set-env openclaw OPENCLAW_COOKIE_SECRET "$(openssl rand -base64 32)"
-
-# 4. Add openclaw-sso to services in manifest-buildpack.yml (uncomment the line)
-
-# 5. Restage
+cf create-service seaweedfs shared openclaw-storage
+cf bind-service openclaw openclaw-storage
 cf restage openclaw
 ```
 
-Users will be redirected to your organization's SSO login page before accessing OpenClaw.
-
-### Disable SSO
+**Option 2: User-provided S3 credentials (AWS S3, MinIO, Ceph, etc.)**
 
 ```bash
-cf set-env openclaw OPENCLAW_SSO_ENABLED false
+cf create-user-provided-service openclaw-storage -p '{
+  "access_key_id": "...",
+  "secret_access_key": "...",
+  "bucket": "openclaw-state",
+  "endpoint": "https://s3.example.com",
+  "region": "us-east-1"
+}'
+cf bind-service openclaw openclaw-storage
 cf restage openclaw
 ```
+
+**Or use deploy.sh:**
+
+```bash
+./deploy.sh
+# Select: 10) Setup S3 persistent storage
+```
+
+The `.profile` script auto-detects S3 credentials from `VCAP_SERVICES` and writes `~/s3.env` for `start.sh` to consume. Supported service types: `seaweedfs`, `s3`, `aws-s3`, `minio`, `ceph`, and `user-provided`.
+
+### Without S3
+
+If S3 is not available, state is ephemeral. This is fine for single-user setups where chat history isn't critical. Configuration is regenerated from env vars on each startup.
 
 ## Node Deployment (Optional)
 
@@ -250,71 +269,39 @@ cf scale openclaw-node -i 5
 
 # Or use deploy.sh:
 ./deploy.sh
-# Select: 9) Scale nodes
+# Select: 8) Scale nodes
 ```
 
 Each instance appears in the gateway with a unique name (`cf-node-0`, `cf-node-1`, etc.).
 
 ### Quick Deploy with deploy.sh
 
-Use option 8 in the interactive menu:
+Use option 7 in the interactive menu:
 
 ```bash
 ./deploy.sh
-# Select: 8) Deploy node (system.run capability)
+# Select: 7) Deploy node (system.run capability)
 ```
 
 This automates token retrieval and network policy setup.
 
 ## Secrets Service (Optional)
 
-Store gateway token, node seed, and cookie secret in a CF user-provided service instead of plain env vars. Secrets are stored in CF's credential store and injected via `VCAP_SERVICES`.
+Store gateway token and node seed in a CF user-provided service instead of plain env vars. Secrets are stored in CF's credential store and injected via `VCAP_SERVICES`.
 
 ```bash
 # Create the secrets service (auto-generates token and seed)
 ./deploy.sh
-# Select: 10) Setup secrets service (CredHub)
+# Select: 9) Setup secrets service (CredHub)
 
 # Or manually:
-cf create-user-provided-service openclaw-secrets -p '{"gateway_token":"...","node_seed":"...","cookie_secret":"..."}'
+cf create-user-provided-service openclaw-secrets -p '{"gateway_token":"...","node_seed":"..."}'
 cf bind-service openclaw openclaw-secrets
 cf bind-service openclaw-node openclaw-secrets
 cf restage openclaw
 ```
 
 The `.profile` script automatically extracts secrets from the `openclaw-secrets` service binding. These take precedence over env vars.
-
-## Persistent Storage with NFS (Optional)
-
-By default, OpenClaw state (chat history, device pairings, workspace data) is stored in the container's ephemeral filesystem and lost on restage or crash. Bind an NFS volume service to persist this data.
-
-### Prerequisites
-
-- NFS Volume Services broker installed on your CF foundation
-- An NFS server share accessible from the CF cells
-
-### Setup
-
-```bash
-# 1. Create an NFS service instance
-cf create-service nfs Existing openclaw-storage -c '{"share":"nfs-server.example.com/exports/openclaw"}'
-
-# 2. Bind with volume mount
-cf bind-service openclaw openclaw-storage -c '{"uid":"vcap","gid":"vcap","mount":"/home/vcap/app/data/persistent"}'
-
-# 3. Restage to mount the volume
-cf restage openclaw
-
-# Or use deploy.sh:
-./deploy.sh
-# Select: 11) Setup NFS persistent storage
-```
-
-The `.profile` script auto-detects the NFS mount from `VCAP_SERVICES` and sets `OPENCLAW_STATE_DIR` to point to it. No additional configuration needed.
-
-### Without NFS
-
-If NFS is not available on your foundation, state is ephemeral. This is fine for single-user setups where chat history isn't critical. Templates and configuration are regenerated from env vars on each startup.
 
 ## Multi-User Deployment
 
@@ -350,23 +337,22 @@ Use `deploy.sh` for guided setup:
 ```
 
 **Single Instance:**
-1. **Full setup** - Creates GenAI service, sets gateway token, deploys, optional SSO
+1. **Full setup** - Creates GenAI service, sets gateway token, deploys
 2. **Deploy with buildpack** - Just deploys the app
 3. **Deploy with Docker** - Alternative Docker deployment
 4. **Create/bind GenAI service** - Setup marketplace LLM model
-5. **Enable SSO** - Setup p-identity SSO
-6. **Set gateway token** - Configure persistent auth token
-7. **Set manual API keys** - Alternative to GenAI service (uses cloud APIs directly)
-8. **Deploy node** - Deploy a node for system.run capabilities
-9. **Scale nodes** - Scale node instances up or down
-10. **Setup secrets service** - Store secrets in CredHub/user-provided service
-11. **Setup NFS persistent storage** - Bind NFS volume for persistent state
-12. **Show app info** - Display status, services, and env vars
+5. **Set gateway token** - Configure persistent auth token
+6. **Set manual API keys** - Alternative to GenAI service (uses cloud APIs directly)
+7. **Deploy node** - Deploy a node for system.run capabilities
+8. **Scale nodes** - Scale node instances up or down
+9. **Setup secrets service** - Store secrets in CredHub/user-provided service
+10. **Setup S3 persistent storage** - Bind S3 service for persistent state
+11. **Show app info** - Display status, services, and env vars
 
 **Multi-User:**
-13. **Create user instance** - Provision isolated gateway+node per user
-14. **Destroy user instance** - Tear down a user's instance
-15. **List all instances** - Show all deployed OpenClaw apps
+12. **Create user instance** - Provision isolated gateway+node per user
+13. **Destroy user instance** - Tear down a user's instance
+14. **List all instances** - Show all deployed OpenClaw apps
 
 CLI subcommands are also supported:
 
@@ -386,9 +372,8 @@ CLI subcommands are also supported:
 | `OPENCLAW_NODE_SEED` | For node | Shared seed for deterministic keypair derivation (recommended) |
 | `OPENCLAW_NODE_MAX_INSTANCES` | No | Number of node instance keypairs to pre-register (default: `1`) |
 | `OPENCLAW_PINNED_VERSION` | No | Expected OpenClaw version; warns on mismatch to protect against format changes |
-| `OPENCLAW_SSO_ENABLED` | No | Set to `true` to enable SSO proxy |
-| `OPENCLAW_COOKIE_SECRET` | If SSO | Base64-encoded secret for SSO session cookies |
 | `OPENCLAW_STATE_DIR` | No | Data directory (default: `/home/vcap/app/data`) |
+| `S3_PREFIX` | No | S3 key prefix for multi-tenant setups (default: `openclaw`) |
 | `ANTHROPIC_API_KEY` | No | Manual Anthropic API key (alternative to GenAI service) |
 | `OPENAI_API_KEY` | No | Manual OpenAI API key (alternative to GenAI service) |
 | `OPENCLAW_NODE_DEVICE_PUBLIC_KEY` | Legacy | Ed25519 public key (PEM) for node auto-pairing |
@@ -402,23 +387,20 @@ CLI subcommands are also supported:
 | Service | Type | Purpose |
 |---------|------|---------|
 | `openclaw-genai` | `genai` | LLM model from CF marketplace |
-| `openclaw-sso` | `p-identity` | SSO authentication |
-| `openclaw-secrets` | `user-provided` | Centralized secrets (gateway_token, node_seed, cookie_secret) |
-| `openclaw-storage` | `nfs` | Persistent volume for state data (optional) |
+| `openclaw-secrets` | `user-provided` | Centralized secrets (gateway_token, node_seed) |
+| `openclaw-storage` | `seaweedfs` / `user-provided` | S3-compatible object storage for persistent state |
 
 ## Security Notes
 
 - **Gateway auth is mandatory** in recent OpenClaw versions. The `.profile` script always configures token-based auth.
 - **CVE-2026-25253** (CVSS 8.8): Auth token exfiltration leading to RCE. Patched in OpenClaw v2026.1.29. Use a patched version.
-- When using SSO, the oauth2-proxy handles authentication before requests reach OpenClaw. The gateway token still applies for direct API/WebSocket connections.
 - API keys and tokens set via `cf set-env` are stored in CF's encrypted credential store.
 
 ## Requirements
 
 - Cloud Foundry with Node.js buildpack (Node 22+ support)
 - GenAI service broker (for LLM integration)
-- SSO tile / p-identity service (for SSO, optional)
-- NFS Volume Services broker (for persistent storage, optional)
+- S3-compatible object storage service (for persistent state, optional — SeaweedFS, MinIO, Ceph, or AWS S3)
 - 2GB+ memory allocation
 - 4GB+ disk quota (for buildpack deployment)
 
@@ -434,10 +416,14 @@ Check logs: `cf logs openclaw --recent`
 cf logs openclaw --recent | grep "Token:"
 ```
 
-### SSO redirect loop
-- Verify the cookie secret is set: `cf env openclaw | grep COOKIE_SECRET`
-- Check that the p-identity service plan's redirect URIs allow your app URL
-- View oauth2-proxy logs: `cf logs openclaw --recent | grep oauth2`
+### S3 sync issues
+```bash
+# Check S3 sync logs
+cf logs openclaw --recent | grep "s3-sync"
+
+# Verify S3 service is bound
+cf env openclaw | grep -A5 "openclaw-storage"
+```
 
 ### GenAI model not working
 ```bash

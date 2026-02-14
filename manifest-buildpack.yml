@@ -5,7 +5,6 @@
 #   1. Clone and build OpenClaw: pnpm install && pnpm build && pnpm ui:build
 #   2. Copy these deployment files into the OpenClaw directory
 #   3. Create a GenAI service: cf create-service genai <plan> openclaw-genai
-#   4. (Optional) Enable SSO: see README.md for setup instructions
 ---
 applications:
   - name: openclaw
@@ -16,7 +15,7 @@ applications:
     buildpacks:
       - nodejs_buildpack
 
-    # start.sh handles SSO proxy (if enabled) or direct startup
+    # start.sh handles S3 sync lifecycle (if bound) or direct startup
     command: bash start.sh
 
     env:
@@ -35,12 +34,6 @@ applications:
       # Set a fixed token for connecting clients.
       # If not set, a random token is auto-generated on each startup (check cf logs).
       # OPENCLAW_GATEWAY_TOKEN: (set via cf set-env openclaw OPENCLAW_GATEWAY_TOKEN <token>)
-
-      # --- SSO Configuration ---
-      # Set to "true" to enable oauth2-proxy SSO in front of OpenClaw.
-      # Requires p-identity service bound (openclaw-sso).
-      # OPENCLAW_SSO_ENABLED: "true"
-      # OPENCLAW_COOKIE_SECRET: (set via cf set-env, use: openssl rand -base64 32)
 
       # --- Manual API Keys (alternative to GenAI service) ---
       # ANTHROPIC_API_KEY: (set via cf set-env)
@@ -65,11 +58,11 @@ applications:
     routes:
       - route: openclaw.apps.tas-tdc.kuhn-labs.com
 
-    health-check-type: port
+    health-check-type: http
+    health-check-http-endpoint: /
     timeout: 300
 
     services:
       - tanzu-all-models
-      - openclaw-sso
-      # - openclaw-secrets  # User-provided service with gateway_token, node_seed, cookie_secret
-      # - openclaw-storage  # NFS volume service for persistent state (chat history, pairings)
+      # - openclaw-secrets  # User-provided service with gateway_token, node_seed
+      # - openclaw-storage  # S3-compatible object storage for persistent state

@@ -1,214 +1,31 @@
 #!/bin/bash
 # OpenClaw Cloud Foundry Startup Script
-# Handles two modes:
-#   1. Direct: OpenClaw listens on $PORT (default)
-#   2. SSO:    oauth2-proxy on $PORT → token-inject on :8082 → OpenClaw on :8081
+# Handles S3-backed persistent storage when ~/s3.env is present,
+# otherwise runs OpenClaw directly.
 set -e
 
 OPENCLAW_PORT="${PORT:-8080}"
-OPENCLAW_INTERNAL_PORT=8081
-TOKEN_PROXY_PORT=8082
-OAUTH2_PROXY_VERSION="7.8.1"
-DATA_DIR="${OPENCLAW_STATE_DIR:-/home/vcap/app/data}"
 
-mkdir -p "$DATA_DIR"
+if [ -f ~/s3.env ]; then
+    source ~/s3.env
+    echo "=== S3 Persistent Storage Enabled ==="
+    node s3-sync.cjs restore
 
-# ============================================================
-# SSO Mode: oauth2-proxy in front of OpenClaw
-# ============================================================
-if [ "${OPENCLAW_SSO_ENABLED}" = "true" ] && [ -f "${HOME}/sso.env" ]; then
-    echo "=== SSO Mode Enabled ==="
-
-    # Load SSO credentials written by .profile
-    source "${HOME}/sso.env"
-
-    if [ -z "$SSO_CLIENT_ID" ] || [ -z "$SSO_CLIENT_SECRET" ] || [ -z "$SSO_AUTH_DOMAIN" ]; then
-        echo "WARNING: SSO credentials incomplete. Falling back to direct mode."
-        echo "  Ensure p-identity service is bound: cf bind-service openclaw openclaw-sso"
-        exec node dist/index.js gateway --allow-unconfigured --port "$OPENCLAW_PORT" --bind lan
-    fi
-
-    # Download oauth2-proxy if not cached
-    PROXY_BIN="${DATA_DIR}/oauth2-proxy"
-    if [ ! -x "$PROXY_BIN" ]; then
-        echo "Downloading oauth2-proxy v${OAUTH2_PROXY_VERSION}..."
-        PROXY_URL="https://github.com/oauth2-proxy/oauth2-proxy/releases/download/v${OAUTH2_PROXY_VERSION}/oauth2-proxy-v${OAUTH2_PROXY_VERSION}.linux-amd64.tar.gz"
-        curl -sfL "$PROXY_URL" | tar xz -C "$DATA_DIR" --strip-components=1 "oauth2-proxy-v${OAUTH2_PROXY_VERSION}.linux-amd64/oauth2-proxy"
-        chmod +x "$PROXY_BIN"
-        echo "oauth2-proxy downloaded and cached at ${PROXY_BIN}"
-    else
-        echo "Using cached oauth2-proxy at ${PROXY_BIN}"
-    fi
-
-    # Generate cookie secret if not provided
-    COOKIE_SECRET="${OPENCLAW_COOKIE_SECRET:-$(openssl rand -base64 32)}"
-
-    # Determine the OIDC issuer URL
-    # CF UAA has a split architecture: login.sys.* serves the OIDC discovery
-    # endpoint but reports uaa.sys.* as the issuer. oauth2-proxy strict issuer
-    # checking will fail, so we use --insecure-oidc-skip-issuer-verification.
-    # Use auth_domain as the discovery base URL.
-    OIDC_ISSUER="${SSO_AUTH_DOMAIN}"
-    if [[ "$OIDC_ISSUER" == */oauth/token ]]; then
-        OIDC_ISSUER="${OIDC_ISSUER%/oauth/token}"
-    fi
-
-    # Determine the redirect URL based on the app route
-    VCAP_APP=$(echo "$VCAP_APPLICATION" | python3 -c "import sys,json; app=json.load(sys.stdin); print(app.get('application_uris',['localhost'])[0])" 2>/dev/null || echo "localhost")
-    REDIRECT_URL="https://${VCAP_APP}/oauth2/callback"
-
-    # Get the gateway token for the redirect proxy
-    GATEWAY_TOKEN="${SSO_GATEWAY_TOKEN:-${OPENCLAW_GATEWAY_TOKEN}}"
-
-    # ---- Start OpenClaw ----
-    echo "Starting OpenClaw on internal port ${OPENCLAW_INTERNAL_PORT}..."
-    node dist/index.js gateway --allow-unconfigured --port "$OPENCLAW_INTERNAL_PORT" --bind lan &
+    node dist/index.js gateway --allow-unconfigured --port "$OPENCLAW_PORT" --bind lan &
     OPENCLAW_PID=$!
 
-    # ---- Start token injection proxy ----
-    # This proxy sits between oauth2-proxy and OpenClaw. For HTML page loads
-    # it injects a <script> tag that stores the gateway token in localStorage
-    # so the Control UI can authenticate WebSocket connections.
-    # All other requests (including WebSocket upgrades) are raw-piped through.
-    echo "Starting token injection proxy on port ${TOKEN_PROXY_PORT}..."
-    export GATEWAY_TOKEN="${GATEWAY_TOKEN}"
-    export UPSTREAM_PORT="${OPENCLAW_INTERNAL_PORT}"
-    export LISTEN_PORT="${TOKEN_PROXY_PORT}"
-    node -e "
-const http = require('http');
-const net = require('net');
-const TOKEN = process.env.GATEWAY_TOKEN;
-const UPSTREAM = parseInt(process.env.UPSTREAM_PORT, 10);
+    node s3-sync.cjs backup-loop &
+    BACKUP_PID=$!
 
-// Script tag that injects the gateway token into localStorage before the app JS runs.
-// The Control UI reads from localStorage key 'openclaw.control.settings.v1' with
-// the token stored under the 'token' property.
-const INJECT_SCRIPT = '<script>try{var k=\"openclaw.control.settings.v1\",s=JSON.parse(localStorage.getItem(k)||\"{}\");s.token=\"' + TOKEN + '\";localStorage.setItem(k,JSON.stringify(s))}catch(e){}</script>';
-
-const server = http.createServer((req, res) => {
-    const url = new URL(req.url, 'http://localhost');
-
-    // For page loads (/ and /chat), proxy to OpenClaw and inject the token
-    // into the HTML response so localStorage gets set before the app JS runs
-    const isPageLoad = (url.pathname === '/' || url.pathname === '/chat') && req.method === 'GET';
-
-    // Strip Accept-Encoding for page loads so we get uncompressed HTML to inject into
-    const headers = { ...req.headers };
-    if (isPageLoad) {
-        delete headers['accept-encoding'];
+    cleanup() {
+        echo "Shutting down — flushing state to S3..."
+        node s3-sync.cjs flush
+        kill "$OPENCLAW_PID" "$BACKUP_PID" 2>/dev/null || true
     }
+    trap cleanup SIGTERM SIGINT
 
-    const opts = {
-        hostname: '127.0.0.1',
-        port: UPSTREAM,
-        path: req.url,
-        method: req.method,
-        headers: headers
-    };
-    const proxyReq = http.request(opts, (proxyRes) => {
-        const ct = (proxyRes.headers['content-type'] || '');
-        if (isPageLoad && ct.includes('text/html')) {
-            // Buffer the HTML, inject token script, then send
-            const chunks = [];
-            proxyRes.on('data', (c) => chunks.push(c));
-            proxyRes.on('end', () => {
-                let html = Buffer.concat(chunks).toString();
-                html = html.replace('<head>', '<head>' + INJECT_SCRIPT);
-                const respHeaders = { ...proxyRes.headers };
-                respHeaders['content-length'] = Buffer.byteLength(html);
-                delete respHeaders['content-encoding'];
-                res.writeHead(proxyRes.statusCode, respHeaders);
-                res.end(html);
-            });
-        } else {
-            // Non-HTML or non-page-load: stream through
-            res.writeHead(proxyRes.statusCode, proxyRes.headers);
-            proxyRes.pipe(res);
-        }
-    });
-    proxyReq.on('error', () => {
-        if (isPageLoad) {
-            // Serve a loading page that injects the token into localStorage and auto-refreshes.
-            // This handles the startup race condition: the browser gets the token saved immediately,
-            // and when the page refreshes after OpenClaw is ready, WS auth will work.
-            const loadingHtml = '<!DOCTYPE html><html><head>' + INJECT_SCRIPT + '<meta http-equiv=\"refresh\" content=\"5\"><style>body{font-family:system-ui;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;color:#666}div{text-align:center}h2{color:#333}.spinner{width:40px;height:40px;border:4px solid #eee;border-top-color:#333;border-radius:50%;animation:spin 1s linear infinite;margin:20px auto}@keyframes spin{to{transform:rotate(360deg)}}</style></head><body><div><div class=\"spinner\"></div><h2>Starting OpenClaw</h2><p>The application is starting up. This page will refresh automatically.</p></div></body></html>';
-            res.writeHead(200, { 'Content-Type': 'text/html', 'Content-Length': Buffer.byteLength(loadingHtml) });
-            res.end(loadingHtml);
-        } else {
-            res.writeHead(502);
-            res.end('upstream unavailable');
-        }
-    });
-    req.pipe(proxyReq);
-});
-
-// WebSocket upgrades: raw TCP pipe to OpenClaw
-server.on('upgrade', (req, socket, head) => {
-    const conn = net.connect(UPSTREAM, '127.0.0.1', () => {
-        // Reconstruct the HTTP upgrade request
-        let rawReq = req.method + ' ' + req.url + ' HTTP/' + req.httpVersion + '\r\n';
-        for (let i = 0; i < req.rawHeaders.length; i += 2) {
-            rawReq += req.rawHeaders[i] + ': ' + req.rawHeaders[i + 1] + '\r\n';
-        }
-        rawReq += '\r\n';
-        conn.write(rawReq);
-        if (head && head.length > 0) conn.write(head);
-        socket.pipe(conn);
-        conn.pipe(socket);
-    });
-    conn.on('error', () => socket.destroy());
-    socket.on('error', () => conn.destroy());
-});
-
-server.listen(parseInt(process.env.LISTEN_PORT, 10), '127.0.0.1', () => {
-    console.log('Token injection proxy ready on 127.0.0.1:' + process.env.LISTEN_PORT);
-});
-" &
-    TOKEN_PROXY_PID=$!
-
-    # Give OpenClaw and the redirect proxy a moment to start
-    sleep 3
-
-    # ---- Start oauth2-proxy ----
-    echo "Starting oauth2-proxy on port ${OPENCLAW_PORT}..."
-    echo "  OIDC Issuer: ${OIDC_ISSUER}"
-    echo "  Redirect URL: ${REDIRECT_URL}"
-    echo "  Upstream: http://127.0.0.1:${TOKEN_PROXY_PORT} (token inject) → http://127.0.0.1:${OPENCLAW_INTERNAL_PORT}"
-
-    "$PROXY_BIN" \
-        --provider=oidc \
-        --oidc-issuer-url="${OIDC_ISSUER}" \
-        --insecure-oidc-skip-issuer-verification=true \
-        --client-id="${SSO_CLIENT_ID}" \
-        --client-secret="${SSO_CLIENT_SECRET}" \
-        --redirect-url="${REDIRECT_URL}" \
-        --upstream="http://127.0.0.1:${TOKEN_PROXY_PORT}" \
-        --http-address="0.0.0.0:${OPENCLAW_PORT}" \
-        --cookie-secret="${COOKIE_SECRET}" \
-        --cookie-secure=true \
-        --scope="openid" \
-        --email-domain="*" \
-        --pass-access-token=true \
-        --pass-authorization-header=true \
-        --skip-provider-button=true \
-        --reverse-proxy=true &
-    PROXY_PID=$!
-
-    echo "=== SSO proxy started (PID: ${PROXY_PID}), Token proxy (PID: ${TOKEN_PROXY_PID}), OpenClaw (PID: ${OPENCLAW_PID}) ==="
-
-    # Wait for any process to exit
-    wait -n "$OPENCLAW_PID" "$TOKEN_PROXY_PID" "$PROXY_PID" 2>/dev/null || true
-    EXIT_CODE=$?
-
-    echo "A process exited with code ${EXIT_CODE}. Shutting down..."
-    kill "$OPENCLAW_PID" "$TOKEN_PROXY_PID" "$PROXY_PID" 2>/dev/null || true
-    exit "$EXIT_CODE"
-
+    wait "$OPENCLAW_PID"
 else
-    # ============================================================
-    # Direct Mode: OpenClaw serves directly on $PORT
-    # ============================================================
-    echo "=== Direct Mode (no SSO) ==="
-    echo "Starting OpenClaw on port ${OPENCLAW_PORT}..."
+    echo "=== Direct Mode ==="
     exec node dist/index.js gateway --allow-unconfigured --port "$OPENCLAW_PORT" --bind lan
 fi

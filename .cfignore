@@ -50,9 +50,6 @@ fly.private.toml
 render.yaml
 appcast.xml
 
-# oauth2-proxy binary (downloaded at runtime, not needed in push)
-oauth2-proxy
-
 # Secrets
 .secrets.baseline
 .detect-secrets.cfg
