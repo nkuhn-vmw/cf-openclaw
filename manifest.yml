@@ -1,39 +1,42 @@
 # Cloud Foundry Docker deployment manifest for OpenClaw
-# NOTE: This is a secondary/reference option. The buildpack approach
-# (manifest-buildpack.yml) is recommended as it builds from source.
+# Uses pre-built community Docker image (alpine/openclaw) with GenAI + S3 integration.
 #
-# IMPORTANT: There is no official 'openclaw/openclaw' Docker Hub image.
-# You must either:
-#   - Build locally: docker build -t openclaw/openclaw .
-#   - Push to a private registry your CF can access
-#   - Use a community image (e.g., alpine/openclaw)
+# Since Docker apps don't include local files, the command bootstraps by
+# downloading .profile, start.sh, and s3-sync.cjs from GitHub at runtime.
 #
 # Deploy with: cf push -f manifest.yml
 ---
 applications:
-  - name: openclaw
+  - name: openclaw-docker
     memory: 2G
-    disk_quota: 2G
+    disk_quota: 6G
     instances: 1
 
-    # Docker deployment - update the image to your registry/community image
     docker:
-      image: openclaw/openclaw:latest  # TODO: Change to your actual image
+      image: alpine/openclaw:latest
 
-    command: bash start.sh
+    command: >-
+      bash -c '
+        REPO="https://raw.githubusercontent.com/nkuhn-vmw/cf-openclaw/main"
+        curl -sfL "$REPO/.profile" -o .profile
+        curl -sfL "$REPO/start.sh" -o start.sh
+        curl -sfL "$REPO/s3-sync.cjs" -o s3-sync.cjs
+        chmod +x start.sh
+        source .profile
+        exec bash start.sh
+      '
 
     env:
       NODE_ENV: production
-      NODE_OPTIONS: "--max-old-space-size=1536"
-      OPENCLAW_STATE_DIR: /home/vcap/app/data
-      OPENCLAW_PREFER_PNPM: "1"
-      # OPENCLAW_GATEWAY_TOKEN: (set via cf set-env)
+      OPENCLAW_STATE_DIR: /home/node/data
+
+    health-check-type: http
+    health-check-http-endpoint: /
+    timeout: 300
 
     routes:
-      - route: openclaw.apps.tas-tdc.kuhn-labs.com
-
-    health-check-type: port
-    timeout: 180
+      - route: openclaw-docker.apps.tas-tdc.kuhn-labs.com
 
     services:
-      - openclaw-genai
+      - tanzu-all-models
+      - openclaw-storage

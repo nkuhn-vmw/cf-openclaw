@@ -67,6 +67,7 @@ if (genaiBinding) {
     const apiKey = genaiBinding.api_key || genaiBinding.endpoint?.api_key;
     const configUrl = genaiBinding.endpoint?.config_url;
     let modelName = genaiBinding.model_name; // only in deprecated format
+    let allModels;
     const wireFormat = genaiBinding.wire_format || 'openai';
 
     if (!apiBase || !apiKey) {
@@ -82,7 +83,7 @@ if (genaiBinding) {
             console.log('  Multi-model format detected - discovering available models...');
             try {
                 const modelsUrl = apiBase.replace(/\\/+$/, '') + '/openai/v1/models';
-                const curlCmd = 'curl -sf -H \"Authorization: Bearer ' + apiKey + '\" \"' + modelsUrl + '\"';
+                const curlCmd = 'curl -sfk -H \"Authorization: Bearer ' + apiKey + '\" \"' + modelsUrl + '\"';
                 const modelsResponse = execSync(curlCmd, { timeout: 10000 }).toString();
                 const modelsData = JSON.parse(modelsResponse);
 
